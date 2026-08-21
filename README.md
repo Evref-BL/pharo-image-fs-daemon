@@ -34,8 +34,8 @@ Release:
 Create a release by pushing a matching version tag:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The Pharo package uses the same version number to locate the matching daemon
