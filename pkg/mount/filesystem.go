@@ -193,6 +193,18 @@ func (fsys *ProjectionFileSystem) Read(_ string, buff []byte, ofst int64, fh uin
 	return read
 }
 
+func (fsys *ProjectionFileSystem) Readlink(projectionPath string) (int, string) {
+	entry, errno := fsys.entryForPath(projectionPath)
+	if errno != 0 {
+		return -int(errno), ""
+	}
+	if entry.Kind != protocol.Symlink {
+		return -int(syscall.EINVAL), ""
+	}
+
+	return 0, entry.Target
+}
+
 func (fsys *ProjectionFileSystem) Write(_ string, buff []byte, ofst int64, fh uint64) int {
 	handle, ok := fsys.handle(fh)
 	if !ok {
@@ -553,6 +565,8 @@ func modeForKind(kind protocol.EntryKind, writable bool) uint32 {
 			return syscall.S_IFDIR | 0o755
 		}
 		return syscall.S_IFDIR | 0o555
+	case protocol.Symlink:
+		return syscall.S_IFLNK | 0o777
 	default:
 		if writable {
 			return syscall.S_IFREG | 0o644

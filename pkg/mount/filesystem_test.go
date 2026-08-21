@@ -18,6 +18,7 @@ func TestRootReaddirUsesProjectionClient(t *testing.T) {
 			"/": {
 				{Name: "tonel", Kind: protocol.Directory},
 				{Name: "critiques", Kind: protocol.Directory},
+				{Name: "repositories", Kind: protocol.Directory},
 			},
 		},
 	}
@@ -32,7 +33,7 @@ func TestRootReaddirUsesProjectionClient(t *testing.T) {
 		t.Fatalf("readdir errno: %v", errc)
 	}
 
-	if strings.Join(names, ",") != ".,..,tonel,critiques,errors" {
+	if strings.Join(names, ",") != ".,..,tonel,critiques,repositories,errors" {
 		t.Fatalf("unexpected entries: %#v", names)
 	}
 }
@@ -56,6 +57,50 @@ func TestTonelDirectoriesAreWritableForEditorTempFiles(t *testing.T) {
 
 	if stat.Mode&0o200 == 0 {
 		t.Fatalf("expected writable tonel directory mode, got %#o", stat.Mode)
+	}
+}
+
+func TestRepositorySymlinkStatsAsSymlink(t *testing.T) {
+	client := &fakeClient{
+		stats: map[string]protocol.Entry{
+			"/repositories/MCP": {
+				Name:   "MCP",
+				Kind:   protocol.Symlink,
+				Target: "/Users/example/MCP",
+			},
+		},
+	}
+	fsys := NewProjectionFileSystem(client)
+
+	var stat fuse.Stat_t
+	errc := fsys.Getattr("/repositories/MCP", &stat, 0)
+	if errc != 0 {
+		t.Fatalf("getattr errno: %v", errc)
+	}
+
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFLNK {
+		t.Fatalf("expected symlink mode, got %#o", stat.Mode)
+	}
+}
+
+func TestRepositorySymlinkReadlinkUsesProjectionTarget(t *testing.T) {
+	client := &fakeClient{
+		stats: map[string]protocol.Entry{
+			"/repositories/MCP": {
+				Name:   "MCP",
+				Kind:   protocol.Symlink,
+				Target: "/Users/example/MCP",
+			},
+		},
+	}
+	fsys := NewProjectionFileSystem(client)
+
+	errc, target := fsys.Readlink("/repositories/MCP")
+	if errc != 0 {
+		t.Fatalf("readlink errno: %v", errc)
+	}
+	if target != "/Users/example/MCP" {
+		t.Fatalf("unexpected target: %s", target)
 	}
 }
 

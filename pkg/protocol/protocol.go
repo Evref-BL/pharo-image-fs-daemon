@@ -19,6 +19,7 @@ type Entry struct {
 	Kind     EntryKind `json:"kind"`
 	Size     uint64    `json:"size,omitempty"`
 	Writable bool      `json:"writable,omitempty"`
+	Target   string    `json:"target,omitempty"`
 }
 
 // EntryKind identifies the filesystem kind of a projected entry.
@@ -27,6 +28,7 @@ type EntryKind string
 const (
 	Directory EntryKind = "directory"
 	File      EntryKind = "file"
+	Symlink   EntryKind = "symlink"
 )
 
 // Diagnostic describes feedback Pharo produced while handling a projection

@@ -40,6 +40,27 @@ func TestHTTPClientListPostsProjectionPath(t *testing.T) {
 	}
 }
 
+func TestHTTPClientListDecodesSymlinkTarget(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"entries":[{"name":"MCP","kind":"symlink","target":"/Users/example/MCP"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPClient(server.URL + "/projection")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := client.List(t.Context(), "/repositories")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Kind != Symlink || entries[0].Target != "/Users/example/MCP" {
+		t.Fatalf("unexpected entries: %#v", entries)
+	}
+}
+
 func TestHTTPClientReturnsProtocolErrorMessage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.WriteHeader(http.StatusBadRequest)
