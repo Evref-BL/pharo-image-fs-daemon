@@ -44,13 +44,13 @@ jobs:
         run: brew install --cask fuse-t
 
       - name: Build
-        run: go build -trimpath -ldflags="-s -w" -o dist/${{ matrix.asset }} ./cmd/pharo-image-fs
+        run: go build -trimpath -ldflags="-s -w" -o dist/pharo-image-fs ./cmd/pharo-image-fs
 
       - name: Package
         run: |
           cd dist
-          shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
-          zip ${{ matrix.asset }}.zip ${{ matrix.asset }} ${{ matrix.asset }}.sha256
+          shasum -a 256 pharo-image-fs > pharo-image-fs.sha256
+          zip ${{ matrix.asset }}.zip pharo-image-fs pharo-image-fs.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
