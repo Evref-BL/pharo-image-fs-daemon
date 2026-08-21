@@ -50,13 +50,13 @@ jobs:
         run: |
           cd dist
           shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
-          tar -czf ${{ matrix.asset }}.tar.gz ${{ matrix.asset }} ${{ matrix.asset }}.sha256
+          zip ${{ matrix.asset }}.zip ${{ matrix.asset }} ${{ matrix.asset }}.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}.tar.gz
+          path: dist/${{ matrix.asset }}.zip
           if-no-files-found: error
 
   publish:
@@ -75,4 +75,4 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: dist/*.tar.gz
+          files: dist/*.zip

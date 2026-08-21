@@ -28,8 +28,8 @@ go build -o pharo-image-fs ./cmd/pharo-image-fs
 Tagged releases build prebuilt daemon binaries and attach them to the GitHub
 Release:
 
-- `pharo-image-fs-daemon-darwin-arm64.tar.gz`
-- `pharo-image-fs-daemon-darwin-amd64.tar.gz`
+- `pharo-image-fs-daemon-darwin-arm64.zip`
+- `pharo-image-fs-daemon-darwin-amd64.zip`
 
 Create a release by pushing a matching version tag:
 
