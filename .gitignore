@@ -1,0 +1,3 @@
+/pharo-image-fs
+*.test
+.DS_Store
