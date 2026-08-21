@@ -23,6 +23,24 @@ prebuilt daemon binary, but the platform FUSE dependency is still required.
 go build -o pharo-image-fs ./cmd/pharo-image-fs
 ```
 
+## Releases
+
+Tagged releases build prebuilt daemon binaries and attach them to the GitHub
+Release:
+
+- `pharo-image-fs-daemon-darwin-arm64.tar.gz`
+- `pharo-image-fs-daemon-darwin-amd64.tar.gz`
+
+Create a release by pushing a matching version tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The Pharo package uses the same version number to locate the matching daemon
+release asset.
+
 ## Run
 
 ```sh
