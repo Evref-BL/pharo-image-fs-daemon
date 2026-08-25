@@ -85,6 +85,10 @@ func (fsys *ProjectionFileSystem) Readdir(projectionPath string, fill func(name 
 	fill(".", nil, 0)
 	fill("..", nil, 0)
 	for _, childEntry := range entries {
+		if isIgnoredMetadataName(childEntry.Name) {
+			continue
+		}
+
 		stat := fuse.Stat_t{}
 		childPath := joinProjectionPath(projectionPath, childEntry.Name)
 		childEntry = writableEntryForPath(childPath, childEntry)
@@ -137,7 +141,7 @@ func (fsys *ProjectionFileSystem) Open(projectionPath string, flags int) (int, u
 }
 
 func (fsys *ProjectionFileSystem) Create(projectionPath string, flags int, _ uint32) (int, uint64) {
-	if !isWritableProjectionPath(projectionPath) {
+	if !isWritableProjectionPath(projectionPath) && !isIgnoredMetadataPath(projectionPath) {
 		return -int(syscall.EROFS), ^uint64(0)
 	}
 
@@ -148,6 +152,18 @@ func (fsys *ProjectionFileSystem) Create(projectionPath string, flags int, _ uin
 	}
 	if parentEntry.Kind != protocol.Directory {
 		return -int(syscall.ENOTDIR), ^uint64(0)
+	}
+
+	if isIgnoredMetadataPath(projectionPath) {
+		handle := &FileHandle{
+			path:     projectionPath,
+			contents: []byte{},
+			writable: openFlagsAreWritable(flags),
+			flush: func(context.Context, string, []byte) error {
+				return nil
+			},
+		}
+		return 0, fsys.registerHandle(handle)
 	}
 
 	if _, ok := fsys.overlay.Stat(projectionPath); ok {
@@ -239,6 +255,10 @@ func (fsys *ProjectionFileSystem) Release(_ string, fh uint64) int {
 }
 
 func (fsys *ProjectionFileSystem) Truncate(projectionPath string, size int64, fh uint64) int {
+	if isIgnoredMetadataPath(projectionPath) {
+		return 0
+	}
+
 	if handle, ok := fsys.handle(fh); ok {
 		if errno := handle.Truncate(size); errno != 0 {
 			return -int(errno)
@@ -283,6 +303,11 @@ func (fsys *ProjectionFileSystem) Access(projectionPath string, mask uint32) int
 }
 
 func (fsys *ProjectionFileSystem) Unlink(projectionPath string) int {
+	if isIgnoredMetadataPath(projectionPath) {
+		fsys.overlay.Delete(projectionPath)
+		return 0
+	}
+
 	if fsys.overlay.Delete(projectionPath) {
 		return 0
 	}
@@ -300,6 +325,12 @@ func (fsys *ProjectionFileSystem) Unlink(projectionPath string) int {
 }
 
 func (fsys *ProjectionFileSystem) Rename(oldPath string, newPath string) int {
+	if isIgnoredMetadataPath(oldPath) || isIgnoredMetadataPath(newPath) {
+		fsys.overlay.Delete(oldPath)
+		fsys.overlay.Delete(newPath)
+		return 0
+	}
+
 	contents, ok := fsys.overlay.Read(oldPath)
 	if ok && isProjectedTonelFilePath(newPath) {
 		if err := fsys.writeProjection(context.Background(), newPath, contents); err != nil {
@@ -625,11 +656,19 @@ func isWritableProjectionPath(projectionPath string) bool {
 }
 
 func isProjectedTonelFilePath(projectionPath string) bool {
-	if strings.HasPrefix(path.Base(projectionPath), "._") {
+	if isIgnoredMetadataPath(projectionPath) {
 		return false
 	}
 
 	return strings.HasPrefix(projectionPath, "/tonel/") &&
 		(strings.HasSuffix(path.Base(projectionPath), ".class.st") ||
 			strings.HasSuffix(path.Base(projectionPath), ".extension.st"))
+}
+
+func isIgnoredMetadataPath(projectionPath string) bool {
+	return isIgnoredMetadataName(path.Base(projectionPath))
+}
+
+func isIgnoredMetadataName(name string) bool {
+	return strings.HasPrefix(name, "._") || name == ".DS_Store"
 }

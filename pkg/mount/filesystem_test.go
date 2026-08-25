@@ -443,6 +443,76 @@ func TestProjectedTonelFilePathIgnoresAppleDoubleSidecars(t *testing.T) {
 	}
 }
 
+func TestCreateAppleDoubleSidecarDoesNotWriteProjection(t *testing.T) {
+	client := fakeProjectionClientForTonelPackage()
+	fsys := NewProjectionFileSystem(client)
+
+	sidecarPath := "/tonel/PharoImageFS/._PharoImageFSProjectionHTTPServer.class.st"
+	errc, handle := fsys.Create(sidecarPath, syscall.O_RDWR, 0o644)
+	if errc != 0 {
+		t.Fatalf("create errno: %v", errc)
+	}
+
+	if written := fsys.Write("", []byte("sidecar contents"), 0, handle); written != len("sidecar contents") {
+		t.Fatalf("unexpected write result: %v", written)
+	}
+	if errc := fsys.Flush("", handle); errc != 0 {
+		t.Fatalf("flush errno: %v", errc)
+	}
+
+	if client.writtenPath != "" {
+		t.Fatalf("AppleDouble sidecar should not write projection, wrote %s", client.writtenPath)
+	}
+
+	names := []string{}
+	errc = fsys.Readdir("/tonel/PharoImageFS", func(name string, _ *fuse.Stat_t, _ int64) bool {
+		names = append(names, name)
+		return true
+	}, 0, 0)
+	if errc != 0 {
+		t.Fatalf("readdir errno: %v", errc)
+	}
+	if contains(names, "._PharoImageFSProjectionHTTPServer.class.st") {
+		t.Fatalf("AppleDouble sidecar should stay hidden: %#v", names)
+	}
+}
+
+func TestRenameOverlayFileToAppleDoubleSidecarIsIgnored(t *testing.T) {
+	client := fakeProjectionClientForTonelPackage()
+	fsys := NewProjectionFileSystem(client)
+
+	errc, handle := fsys.Create("/tonel/PharoImageFS/.temporary-sidecar", syscall.O_RDWR, 0o644)
+	if errc != 0 {
+		t.Fatalf("create errno: %v", errc)
+	}
+
+	if written := fsys.Write("", []byte("sidecar contents"), 0, handle); written != len("sidecar contents") {
+		t.Fatalf("unexpected write result: %v", written)
+	}
+	if errc := fsys.Flush("", handle); errc != 0 {
+		t.Fatalf("flush errno: %v", errc)
+	}
+
+	errc = fsys.Rename(
+		"/tonel/PharoImageFS/.temporary-sidecar",
+		"/tonel/PharoImageFS/._PharoImageFSProjectionHTTPServer.class.st")
+	if errc != 0 {
+		t.Fatalf("rename errno: %v", errc)
+	}
+	if client.writtenPath != "" {
+		t.Fatalf("AppleDouble sidecar should not write projection, wrote %s", client.writtenPath)
+	}
+	if _, ok := fsys.overlay.Stat("/tonel/PharoImageFS/.temporary-sidecar"); ok {
+		t.Fatalf("ignored sidecar rename should remove temporary overlay")
+	}
+}
+
+func TestDSStoreIsIgnoredAsMetadata(t *testing.T) {
+	if !isIgnoredMetadataPath("/tonel/PharoImageFS/.DS_Store") {
+		t.Fatalf(".DS_Store should be ignored as macOS metadata")
+	}
+}
+
 func TestMountOptionsSuppressMacOSMetadataFiles(t *testing.T) {
 	options := mountOptions(Config{})
 	joinedOptions := strings.Join(options, " ")
