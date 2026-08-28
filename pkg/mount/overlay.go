@@ -12,13 +12,15 @@ import (
 // Overlay stores files created by editors as part of safe-save workflows before
 // they are committed to the projection by rename.
 type Overlay struct {
-	mu    sync.Mutex
-	files map[string][]byte
+	mu     sync.Mutex
+	files  map[string][]byte
+	hidden map[string]struct{}
 }
 
 func NewOverlay() *Overlay {
 	return &Overlay{
-		files: map[string][]byte{},
+		files:  map[string][]byte{},
+		hidden: map[string]struct{}{},
 	}
 }
 
@@ -27,6 +29,7 @@ func (o *Overlay) Create(projectionPath string, contents []byte) {
 	defer o.mu.Unlock()
 
 	o.files[projectionPath] = append([]byte(nil), contents...)
+	delete(o.hidden, projectionPath)
 }
 
 func (o *Overlay) Read(projectionPath string) ([]byte, bool) {
@@ -53,12 +56,12 @@ func (o *Overlay) Delete(projectionPath string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	if _, ok := o.files[projectionPath]; !ok {
-		return false
-	}
+	_, hadFile := o.files[projectionPath]
+	_, wasHidden := o.hidden[projectionPath]
 
 	delete(o.files, projectionPath)
-	return true
+	delete(o.hidden, projectionPath)
+	return hadFile || wasHidden
 }
 
 func (o *Overlay) Move(oldPath string, newPath string) bool {
@@ -72,12 +75,33 @@ func (o *Overlay) Move(oldPath string, newPath string) bool {
 
 	o.files[newPath] = contents
 	delete(o.files, oldPath)
+	delete(o.hidden, newPath)
 	return true
+}
+
+func (o *Overlay) Hide(projectionPath string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.hidden[projectionPath] = struct{}{}
+	delete(o.files, projectionPath)
+}
+
+func (o *Overlay) IsHidden(projectionPath string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	_, ok := o.hidden[projectionPath]
+	return ok
 }
 
 func (o *Overlay) Stat(projectionPath string) (protocol.Entry, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	if _, ok := o.hidden[projectionPath]; ok {
+		return protocol.Entry{}, false
+	}
 
 	contents, ok := o.files[projectionPath]
 	if !ok {

@@ -79,6 +79,7 @@ func (fsys *ProjectionFileSystem) Readdir(projectionPath string, fill func(name 
 		if err != nil {
 			return -int(errnoFor(err))
 		}
+		projectedEntries = fsys.visibleProjectedEntries(projectionPath, projectedEntries)
 		entries = mergeEntries(projectedEntries, fsys.overlay.EntriesIn(projectionPath), fsys.errors.EntriesIn(projectionPath))
 	}
 
@@ -169,10 +170,12 @@ func (fsys *ProjectionFileSystem) Create(projectionPath string, flags int, _ uin
 	if _, ok := fsys.overlay.Stat(projectionPath); ok {
 		return -int(syscall.EEXIST), ^uint64(0)
 	}
-	if _, err := fsys.client.Stat(context.Background(), projectionPath); err == nil {
-		return -int(syscall.EEXIST), ^uint64(0)
-	} else if !protocol.NotFound(err) {
-		return -int(errnoFor(err)), ^uint64(0)
+	if !fsys.overlay.IsHidden(projectionPath) {
+		if _, err := fsys.client.Stat(context.Background(), projectionPath); err == nil {
+			return -int(syscall.EEXIST), ^uint64(0)
+		} else if !protocol.NotFound(err) {
+			return -int(errnoFor(err)), ^uint64(0)
+		}
 	}
 
 	fsys.overlay.Create(projectionPath, nil)
@@ -378,6 +381,16 @@ func (fsys *ProjectionFileSystem) Rename(oldPath string, newPath string) int {
 		return 0
 	}
 
+	if isProjectedTonelFilePath(oldPath) && isWritableProjectionPath(newPath) && !isProjectedTonelFilePath(newPath) {
+		contents, err := fsys.contentsForPath(oldPath)
+		if err != nil {
+			return -int(errnoFor(err))
+		}
+		fsys.overlay.Create(newPath, contents)
+		fsys.overlay.Hide(oldPath)
+		return 0
+	}
+
 	if !isWritableProjectionPath(oldPath) || !isWritableProjectionPath(newPath) {
 		return -int(syscall.EROFS)
 	}
@@ -391,6 +404,9 @@ func (fsys *ProjectionFileSystem) Rename(oldPath string, newPath string) int {
 func (fsys *ProjectionFileSystem) entryForPath(projectionPath string) (protocol.Entry, syscall.Errno) {
 	if projectionPath == "/" {
 		return protocol.Entry{Name: "/", Kind: protocol.Directory}, 0
+	}
+	if fsys.overlay.IsHidden(projectionPath) {
+		return protocol.Entry{}, syscall.ENOENT
 	}
 	if overlayEntry, ok := fsys.overlay.Stat(projectionPath); ok {
 		return writableEntryForPath(projectionPath, overlayEntry), 0
@@ -446,6 +462,17 @@ func (fsys *ProjectionFileSystem) contentsForPath(projectionPath string) ([]byte
 	}
 
 	return fsys.client.Read(context.Background(), projectionPath)
+}
+
+func (fsys *ProjectionFileSystem) visibleProjectedEntries(parentPath string, entries []protocol.Entry) []protocol.Entry {
+	visible := entries[:0]
+	for _, entry := range entries {
+		if fsys.overlay.IsHidden(joinProjectionPath(parentPath, entry.Name)) {
+			continue
+		}
+		visible = append(visible, entry)
+	}
+	return visible
 }
 
 func resizedContents(contents []byte, size int) []byte {
