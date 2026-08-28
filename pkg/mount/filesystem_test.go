@@ -439,6 +439,91 @@ func TestRenameProjectedTonelFileUsesProjectionProtocol(t *testing.T) {
 	}
 }
 
+func TestRenameProjectedTonelFileToEditorBackupUsesOverlay(t *testing.T) {
+	client := fakeProjectionClientForTonelPackage()
+	client.readContents = []byte("original source")
+	client.stats["/tonel/PharoImageFS/ManifestPharoImageFS.class.st"] = protocol.Entry{
+		Name:     "ManifestPharoImageFS.class.st",
+		Kind:     protocol.File,
+		Writable: true,
+	}
+	client.entries["/tonel/PharoImageFS"] = []protocol.Entry{
+		{
+			Name:     "ManifestPharoImageFS.class.st",
+			Kind:     protocol.File,
+			Writable: true,
+		},
+	}
+	fsys := NewProjectionFileSystem(client)
+
+	errc := fsys.Rename(
+		"/tonel/PharoImageFS/ManifestPharoImageFS.class.st",
+		"/tonel/PharoImageFS/ManifestPharoImageFS.class.st.sb-e827efa4-Wq3FD0")
+	if errc != 0 {
+		t.Fatalf("rename errno: %v", errc)
+	}
+	if client.renamedPath != "" {
+		t.Fatalf("editor backup rename should not call projection rename, called %s", client.renamedPath)
+	}
+
+	var stat fuse.Stat_t
+	errc = fsys.Getattr("/tonel/PharoImageFS/ManifestPharoImageFS.class.st", &stat, 0)
+	if errc != -int(syscall.ENOENT) {
+		t.Fatalf("hidden original getattr errno: %v", errc)
+	}
+
+	names := []string{}
+	errc = fsys.Readdir("/tonel/PharoImageFS", func(name string, _ *fuse.Stat_t, _ int64) bool {
+		names = append(names, name)
+		return true
+	}, 0, 0)
+	if errc != 0 {
+		t.Fatalf("readdir errno: %v", errc)
+	}
+	if contains(names, "ManifestPharoImageFS.class.st") {
+		t.Fatalf("hidden original should not be listed: %#v", names)
+	}
+	if !contains(names, "ManifestPharoImageFS.class.st.sb-e827efa4-Wq3FD0") {
+		t.Fatalf("missing editor backup overlay entry: %#v", names)
+	}
+}
+
+func TestCreateAfterEditorBackupRenameWritesProjection(t *testing.T) {
+	client := fakeProjectionClientForTonelPackage()
+	client.readContents = []byte("original source")
+	client.stats["/tonel/PharoImageFS/ManifestPharoImageFS.class.st"] = protocol.Entry{
+		Name:     "ManifestPharoImageFS.class.st",
+		Kind:     protocol.File,
+		Writable: true,
+	}
+	fsys := NewProjectionFileSystem(client)
+
+	errc := fsys.Rename(
+		"/tonel/PharoImageFS/ManifestPharoImageFS.class.st",
+		"/tonel/PharoImageFS/ManifestPharoImageFS.class.st.sb-e827efa4-Wq3FD0")
+	if errc != 0 {
+		t.Fatalf("rename errno: %v", errc)
+	}
+
+	errc, handle := fsys.Create("/tonel/PharoImageFS/ManifestPharoImageFS.class.st", syscall.O_RDWR, 0o644)
+	if errc != 0 {
+		t.Fatalf("create replacement errno: %v", errc)
+	}
+	if written := fsys.Write("", []byte("replacement source"), 0, handle); written != len("replacement source") {
+		t.Fatalf("unexpected write result: %v", written)
+	}
+	if errc := fsys.Flush("", handle); errc != 0 {
+		t.Fatalf("flush errno: %v", errc)
+	}
+
+	if client.writtenPath != "/tonel/PharoImageFS/ManifestPharoImageFS.class.st" {
+		t.Fatalf("unexpected written path: %s", client.writtenPath)
+	}
+	if string(client.writtenContents) != "replacement source" {
+		t.Fatalf("unexpected written contents: %q", client.writtenContents)
+	}
+}
+
 func TestPathLevelTruncateDefersProjectionWriteUntilHandleFlush(t *testing.T) {
 	client := fakeProjectionClientForTonelPackage()
 	client.readContents = []byte("original source")
@@ -563,6 +648,7 @@ func TestMountOptionsSuppressMacOSMetadataFiles(t *testing.T) {
 
 func fakeProjectionClientForTonelPackage() *fakeClient {
 	return &fakeClient{
+		entries: map[string][]protocol.Entry{},
 		stats: map[string]protocol.Entry{
 			"/tonel/PharoImageFS": {
 				Name:     "PharoImageFS",
