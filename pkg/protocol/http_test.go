@@ -142,3 +142,61 @@ func TestHTTPClientRenamePostsSourceAndTargetPath(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHTTPClientMkdirPostsProjectionPath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/projection/mkdir" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+
+		var body pathRequest
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Path != "/tonel/NewPackage" {
+			t.Fatalf("unexpected projection path: %s", body.Path)
+		}
+
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPClient(server.URL + "/projection")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.Mkdir(t.Context(), "/tonel/NewPackage"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTPClientRmdirPostsProjectionPath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/projection/rmdir" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+
+		var body pathRequest
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Path != "/tonel/OldPackage" {
+			t.Fatalf("unexpected projection path: %s", body.Path)
+		}
+
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPClient(server.URL + "/projection")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.Rmdir(t.Context(), "/tonel/OldPackage"); err != nil {
+		t.Fatal(err)
+	}
+}

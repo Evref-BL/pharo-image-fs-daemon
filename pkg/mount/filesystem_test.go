@@ -164,6 +164,44 @@ func TestCreateProjectedTonelFileWritesProjectionOnFlush(t *testing.T) {
 	}
 }
 
+func TestMkdirTonelPackageUsesProjectionProtocol(t *testing.T) {
+	client := fakeProjectionClientForTonelPackage()
+	fsys := NewProjectionFileSystem(client)
+
+	errc := fsys.Mkdir("/tonel/NewPackage", 0o755)
+	if errc != 0 {
+		t.Fatalf("mkdir errno: %v", errc)
+	}
+
+	if client.mkdirPath != "/tonel/NewPackage" {
+		t.Fatalf("unexpected mkdir path: %s", client.mkdirPath)
+	}
+}
+
+func TestMkdirNestedTonelDirectoryIsRejected(t *testing.T) {
+	client := fakeProjectionClientForTonelPackage()
+	fsys := NewProjectionFileSystem(client)
+
+	errc := fsys.Mkdir("/tonel/PharoImageFS/Nested", 0o755)
+	if errc != -int(syscall.EINVAL) {
+		t.Fatalf("unexpected mkdir errno: %v", errc)
+	}
+}
+
+func TestRmdirTonelPackageUsesProjectionProtocol(t *testing.T) {
+	client := fakeProjectionClientForTonelPackage()
+	fsys := NewProjectionFileSystem(client)
+
+	errc := fsys.Rmdir("/tonel/OldPackage")
+	if errc != 0 {
+		t.Fatalf("rmdir errno: %v", errc)
+	}
+
+	if client.rmdirPath != "/tonel/OldPackage" {
+		t.Fatalf("unexpected rmdir path: %s", client.rmdirPath)
+	}
+}
+
 func TestRenameOverlayFileToTonelFileWritesProjection(t *testing.T) {
 	client := fakeProjectionClientForTonelPackage()
 	client.stats["/tonel/PharoImageFS/PharoImageFSProjectionBackend.class.st"] = protocol.Entry{

@@ -57,11 +57,15 @@ type fakeClient struct {
 	writeErr        error
 	deleteErr       error
 	renameErr       error
+	mkdirErr        error
+	rmdirErr        error
 	writtenPath     string
 	writtenContents []byte
 	deletedPath     string
 	renamedPath     string
 	renameTarget    string
+	mkdirPath       string
+	rmdirPath       string
 	readContents    []byte
 }
 
@@ -108,5 +112,23 @@ func (c *fakeClient) Rename(_ context.Context, sourcePath string, targetPath str
 
 	c.renamedPath = sourcePath
 	c.renameTarget = targetPath
+	return nil
+}
+
+func (c *fakeClient) Mkdir(_ context.Context, path string) error {
+	if c.mkdirErr != nil {
+		return c.mkdirErr
+	}
+
+	c.mkdirPath = path
+	return nil
+}
+
+func (c *fakeClient) Rmdir(_ context.Context, path string) error {
+	if c.rmdirErr != nil {
+		return c.rmdirErr
+	}
+
+	c.rmdirPath = path
 	return nil
 }

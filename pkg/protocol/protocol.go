@@ -53,6 +53,8 @@ type Client interface {
 	Write(ctx context.Context, path string, contents []byte) (WriteResult, error)
 	Delete(ctx context.Context, path string) error
 	Rename(ctx context.Context, sourcePath string, targetPath string) error
+	Mkdir(ctx context.Context, path string) error
+	Rmdir(ctx context.Context, path string) error
 }
 
 // Error is a projection protocol error.
@@ -157,6 +159,16 @@ func (c *HTTPClient) Rename(ctx context.Context, sourcePath string, targetPath s
 		TargetPath: targetPath,
 	}
 	return c.post(ctx, "rename", request, &response)
+}
+
+func (c *HTTPClient) Mkdir(ctx context.Context, projectionPath string) error {
+	var response emptyResponse
+	return c.post(ctx, "mkdir", pathRequest{Path: projectionPath}, &response)
+}
+
+func (c *HTTPClient) Rmdir(ctx context.Context, projectionPath string) error {
+	var response emptyResponse
+	return c.post(ctx, "rmdir", pathRequest{Path: projectionPath}, &response)
 }
 
 func (c *HTTPClient) post(ctx context.Context, operation string, requestBody any, responseBody any) error {

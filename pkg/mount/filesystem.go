@@ -324,6 +324,34 @@ func (fsys *ProjectionFileSystem) Unlink(projectionPath string) int {
 	return 0
 }
 
+func (fsys *ProjectionFileSystem) Mkdir(projectionPath string, _ uint32) int {
+	if !isProjectedTonelPackagePath(projectionPath) {
+		if isWritableProjectionPath(projectionPath) {
+			return -int(syscall.EINVAL)
+		}
+		return -int(syscall.EROFS)
+	}
+	if err := fsys.client.Mkdir(context.Background(), projectionPath); err != nil {
+		fsys.logf("mkdir %s failed: %v", projectionPath, err)
+		return -int(errnoFor(err))
+	}
+	return 0
+}
+
+func (fsys *ProjectionFileSystem) Rmdir(projectionPath string) int {
+	if !isProjectedTonelPackagePath(projectionPath) {
+		if isWritableProjectionPath(projectionPath) {
+			return -int(syscall.EINVAL)
+		}
+		return -int(syscall.EROFS)
+	}
+	if err := fsys.client.Rmdir(context.Background(), projectionPath); err != nil {
+		fsys.logf("rmdir %s failed: %v", projectionPath, err)
+		return -int(errnoFor(err))
+	}
+	return 0
+}
+
 func (fsys *ProjectionFileSystem) Rename(oldPath string, newPath string) int {
 	if isIgnoredMetadataPath(oldPath) || isIgnoredMetadataPath(newPath) {
 		fsys.overlay.Delete(oldPath)
@@ -663,6 +691,12 @@ func isProjectedTonelFilePath(projectionPath string) bool {
 	return strings.HasPrefix(projectionPath, "/tonel/") &&
 		(strings.HasSuffix(path.Base(projectionPath), ".class.st") ||
 			strings.HasSuffix(path.Base(projectionPath), ".extension.st"))
+}
+
+func isProjectedTonelPackagePath(projectionPath string) bool {
+	return strings.HasPrefix(projectionPath, "/tonel/") &&
+		path.Dir(projectionPath) == "/tonel" &&
+		!isIgnoredMetadataPath(projectionPath)
 }
 
 func isIgnoredMetadataPath(projectionPath string) bool {
