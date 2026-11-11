@@ -132,3 +132,25 @@ func (c *fakeClient) Rmdir(_ context.Context, path string) error {
 	c.rmdirPath = path
 	return nil
 }
+
+func fakeProjectionClientForTonelPackage() *fakeClient {
+	return &fakeClient{
+		entries: map[string][]protocol.Entry{},
+		stats: map[string]protocol.Entry{
+			"/tonel/PharoImageFS": {
+				Name:     "PharoImageFS",
+				Kind:     protocol.Directory,
+				Writable: true,
+			},
+		},
+	}
+}
+
+func contains(collection []string, element string) bool {
+	for _, each := range collection {
+		if each == element {
+			return true
+		}
+	}
+	return false
+}

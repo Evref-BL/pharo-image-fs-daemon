@@ -20,6 +20,9 @@ type Entry struct {
 	Size     uint64    `json:"size,omitempty"`
 	Writable bool      `json:"writable,omitempty"`
 	Target   string    `json:"target,omitempty"`
+	// Modified is when the image last saw the entry change, in milliseconds
+	// since the Unix epoch; zero when it does not say.
+	Modified int64 `json:"modified,omitempty"`
 }
 
 // EntryKind identifies the filesystem kind of a projected entry.
