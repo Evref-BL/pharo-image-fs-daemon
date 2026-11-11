@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
-    name: Go test
+  macos:
+    name: macOS (NFS, mounted)
     runs-on: macos-26
 
     steps:
@@ -22,8 +22,32 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Install fuse-t headers
-        run: brew install --cask fuse-t
-
+      # The mount test runs only on machines that can be thrown away: it
+      # drives the kernel's NFS client, which once panicked a Mac running it.
       - name: Test
-        run: go test ./...
+        env:
+          PIFS_MOUNT_TEST: "1"
+        run: go test -count=1 -v ./...
+
+  windows:
+    name: Windows (WinFsp, built)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build and vet
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go build -o /dev/null ./cmd/pharo-image-fs

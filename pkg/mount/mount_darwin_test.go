@@ -150,4 +150,15 @@ func TestMountedProjection(t *testing.T) {
 			t.Fatalf("the class is still in the image")
 		}
 	})
+
+	t.Run("extended attributes stay off the mount", func(t *testing.T) {
+		if output, err := exec.Command("/usr/bin/xattr", "-w", "user.pifs", "1", object).CombinedOutput(); err == nil {
+			t.Fatalf("setting an extended attribute should fail, it succeeded: %s", output)
+		}
+		for _, entry := range server.fsys.overlay.EntriesIn("/tonel/Kernel") {
+			if strings.HasPrefix(entry.Name, "._") {
+				t.Fatalf("the system stored attributes as %s", entry.Name)
+			}
+		}
+	})
 }
