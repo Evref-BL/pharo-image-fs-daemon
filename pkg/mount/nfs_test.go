@@ -322,6 +322,20 @@ func TestHeldSpansMerge(t *testing.T) {
 	}
 }
 
+func TestNFSRefusesAppleDoubleFiles(t *testing.T) {
+	fsys := newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "object"}))
+
+	if _, err := fsys.Create("/tonel/Kernel/._Object.class.st"); !errors.Is(err, syscall.ENOTSUP) {
+		t.Fatalf("creating a ._ file should fail with ENOTSUP, got %v", err)
+	}
+	if _, err := fsys.Create("/tonel/Kernel/.Object.class.st.tmp"); err != nil {
+		t.Fatalf("an editor's own file should still be created: %v", err)
+	}
+	if err := fsys.Rename("/tonel/Kernel/.Object.class.st.tmp", "/tonel/Kernel/._Object.class.st"); !errors.Is(err, syscall.ENOTSUP) {
+		t.Fatalf("renaming to a ._ file should fail with ENOTSUP, got %v", err)
+	}
+}
+
 func TestNFSHandlesNameOnePathForTheDaemonsLife(t *testing.T) {
 	handler := newNFSHandler(newNFSFileSystem(newMemoryClient(nil)))
 	handle := handler.ToHandle(nil, []string{"tonel", "Kernel"})

@@ -94,6 +94,9 @@ func pathError(op string, projectionPath string, errno syscall.Errno) error {
 
 func (fsys *nfsFileSystem) Create(name string) (billy.File, error) {
 	projectionPath := projectionPathFor(name)
+	if isAppleDoublePath(projectionPath) {
+		return nil, pathError("create", projectionPath, syscall.ENOTSUP)
+	}
 	if isIgnoredMetadataPath(projectionPath) {
 		if !isWritableProjectionPath(projectionPath) {
 			return nil, pathError("create", projectionPath, syscall.EROFS)
@@ -161,6 +164,9 @@ func (fsys *nfsFileSystem) Stat(name string) (os.FileInfo, error) {
 func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 	oldPath := projectionPathFor(oldName)
 	newPath := projectionPathFor(newName)
+	if isAppleDoublePath(newPath) {
+		return pathError("rename", newPath, syscall.ENOTSUP)
+	}
 
 	if err := fsys.commitHeld(oldPath); err != nil {
 		return err
@@ -540,6 +546,16 @@ func containsEntryNamed(entries []protocol.Entry, name string) bool {
 		}
 	}
 	return false
+}
+
+// isAppleDoublePath answers whether projectionPath names a "._" file, where
+// the system stores the extended attributes of a volume that cannot hold
+// them, through doubleagentd. The mount refuses them, so setting an attribute
+// fails as on a volume without any: a Mac running this daemon's tests panicked
+// in the NFS client on doubleagentd's path, and mount_nfs's nouserxattr does
+// not keep the client from taking it.
+func isAppleDoublePath(projectionPath string) bool {
+	return strings.HasPrefix(path.Base(projectionPath), "._")
 }
 
 func isSillyRenameName(name string) bool {

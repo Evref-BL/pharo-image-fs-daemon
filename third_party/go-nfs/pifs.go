@@ -9,8 +9,8 @@ package nfs
 //   - ACCESS no longer grants modification of an object whose mode has no
 //     owner write bit.
 //   - Errors carrying a syscall.Errno keep their meaning (EROFS, ENOENT,
-//     EEXIST, ENOTDIR, EISDIR, ENOTEMPTY, EINVAL) instead of becoming IO or
-//     ACCESS.
+//     EEXIST, ENOTDIR, EISDIR, ENOTEMPTY, EINVAL, ENOTSUP) instead of
+//     becoming IO or ACCESS.
 
 import (
 	"errors"
@@ -53,6 +53,8 @@ func statusFromError(err error, fallback NFSStatus) NFSStatus {
 		return NFSStatusAccess
 	case syscall.EIO:
 		return NFSStatusIO
+	case syscall.ENOTSUP:
+		return NFSStatusNotSupp
 	default:
 		return fallback
 	}

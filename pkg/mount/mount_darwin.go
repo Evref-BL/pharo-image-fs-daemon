@@ -67,9 +67,6 @@ func Mount(mountPoint string, client protocol.Client, config Config) error {
 //     second; the client checks a file again whenever it opens it.
 //   - soft,intr fail calls to a gone daemon instead of hanging them.
 //   - nobrowse keeps Finder and Spotlight off it.
-//   - nouserxattr refuses extended attributes, which the system would
-//     otherwise store as "._" files through doubleagentd: a Mac running
-//     this daemon's tests panicked in the NFS client on that path.
 func mountNFSArguments(port int, mountPoint string, config Config) []string {
 	options := []string{
 		"vers=3", "tcp",
@@ -77,7 +74,7 @@ func mountNFSArguments(port int, mountPoint string, config Config) []string {
 		"noresvport", "locallocks", "nordirplus",
 		"actimeo=1", "nonegnamecache",
 		"soft", "intr", "timeo=100", "retrans=5",
-		"nobrowse", "nouserxattr",
+		"nobrowse",
 	}
 	export := "pharo-image-fs"
 	for _, option := range config.MountOptions {
