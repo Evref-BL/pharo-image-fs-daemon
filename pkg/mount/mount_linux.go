@@ -21,8 +21,9 @@ import (
 )
 
 // mountTimeout bounds how long fusermount3 may take to mount: on Ubuntu
-// 26.04 its AppArmor profile can hang it (Launchpad bug 2165030).
-const mountTimeout = 10 * time.Second
+// 26.04 its AppArmor profile can hang it (Launchpad bug 2165030). It is
+// shorter than the 10 s PIFS waits for the mount, so that PIFS reports why.
+const mountTimeout = 5 * time.Second
 
 // Mount serves the projection over FUSE at mountPoint, through the setuid
 // fusermount3, as the user running the daemon. It returns once the
