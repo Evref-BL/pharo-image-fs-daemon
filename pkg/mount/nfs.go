@@ -44,7 +44,10 @@ type nfsFileSystem struct {
 }
 
 func newNFSFileSystem(client protocol.Client) *nfsFileSystem {
-	return &nfsFileSystem{fileSystem: newFileSystem(client), silly: map[string]string{}}
+	fsys := &nfsFileSystem{fileSystem: newFileSystem(client), silly: map[string]string{}}
+	// The client keeps a directory's listing while its time holds still.
+	fsys.listsDirectoriesOnStat = true
+	return fsys
 }
 
 // projectionPathFor answers the projection path of a go-nfs file name, which
@@ -247,12 +250,9 @@ func (fsys *nfsFileSystem) sillyRename(oldPath string, newPath string) syscall.E
 // an open file to ".nfs…", hid it, and the image still has it, as a refused
 // save leaves it.
 func (fsys *nfsFileSystem) showHiddenClass(projectionPath string) {
-	if !fsys.overlay.IsHidden(projectionPath) {
-		return
+	if fsys.fileSystem.showHiddenClass(projectionPath) {
+		fsys.forgetSilly(projectionPath)
 	}
-	fsys.overlay.Delete(projectionPath)
-	fsys.namespaceChanged(projectionPath)
-	fsys.forgetSilly(projectionPath)
 }
 
 // forgetSilly drops the ".nfs…" files that stand for the class at

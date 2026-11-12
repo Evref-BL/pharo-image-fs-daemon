@@ -12,6 +12,10 @@ Tonel synchronization.
 
 - macOS, with nothing to install: the daemon serves NFSv3 on a loopback port
   and mounts it with the system's `mount_nfs`, as the user
+- or Linux with FUSE: the `fuse3` package's setuid `fusermount3` and
+  `/dev/fuse`, which most desktop and server installs have. Ubuntu 25.04 and
+  later let `fusermount3` mount only under the home directory, `/tmp`, `/mnt`,
+  `/media` and `/run/user`
 - a running `pharo-image-fs` projection endpoint
 - Go, for development builds
 
@@ -56,9 +60,18 @@ directory.
 go test ./...
 ```
 
-The test that mounts a projection runs only where `PIFS_MOUNT_TEST=1`, which
-CI sets: it drives the kernel's NFS client, which once panicked a Mac running
-it, so it belongs on machines that can be thrown away.
+The tests that mount a projection run only where `PIFS_MOUNT_TEST=1`, which
+CI sets: they drive the kernel's NFS or FUSE client, and a Mac running them
+once panicked, so they belong on machines that can be thrown away.
+
+The Linux adapter is built only for Linux. Its tests drive go-fuse as the
+kernel does, without mounting, and run elsewhere with a tag:
+
+```sh
+go test -tags fusetest ./pkg/mount
+```
+
+A Linux mount is unmounted with `fusermount3 -u <path>`.
 
 The daemon does not parse or validate Pharo code. It owns mount lifecycle,
 filesystem callbacks, transport, timeouts, and generic filesystem errors.

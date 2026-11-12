@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -85,25 +84,9 @@ func mountNFSArguments(port int, mountPoint string, config Config) []string {
 		"soft", "intr", "timeo=100", "retrans=5",
 		"nobrowse",
 	}
-	export := "pharo-image-fs"
-	for _, option := range config.MountOptions {
-		if name, ok := strings.CutPrefix(option, "volname="); ok {
-			if name = exportNameFor(name); name != "" {
-				export = name
-			}
-			continue
-		}
-		options = append(options, option)
-	}
+	export, others := mountNameAndOptions(config.MountOptions)
+	options = append(options, others...)
 	return []string{"-o", strings.Join(options, ","), "127.0.0.1:/" + export, mountPoint}
-}
-
-var unsafeExportCharacters = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
-
-// exportNameFor answers name as the export path the mount table shows, so
-// that a projection's mount can be told from another's.
-func exportNameFor(name string) string {
-	return strings.Trim(unsafeExportCharacters.ReplaceAllString(name, "-"), "-")
 }
 
 // unmount unmounts the file system with fsid at mountPoint, waiting while it

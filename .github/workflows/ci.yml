@@ -29,9 +29,53 @@ jobs:
           PIFS_MOUNT_TEST: "1"
         run: go test -count=1 -v ./...
 
+      # The Linux adapter's tests drive go-fuse without mounting, anywhere.
+      - name: Test the Linux adapter
+        run: go test -count=1 -tags fusetest ./pkg/mount
+
+  linux:
+    name: Linux (FUSE, mounted, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned: ubuntu-latest moves between releases. 26.04 confines
+        # fusermount3 with AppArmor, as users of it have it.
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, ubuntu-26.04]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Show what mounts FUSE
+        run: |
+          uname -r
+          ls -l "$(command -v fusermount3)" /dev/fuse
+          if [ -e /etc/apparmor.d/fusermount3 ]; then echo "fusermount3 is confined by AppArmor"; fi
+
+      # The mount tests run only on machines that can be thrown away.
+      - name: Test
+        env:
+          PIFS_MOUNT_TEST: "1"
+        run: go test -race -count=1 -timeout 10m -v ./...
+
+      - name: Build as released, without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go build -o /dev/null ./cmd/pharo-image-fs
+
   windows:
     name: Windows (WinFsp, built)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
