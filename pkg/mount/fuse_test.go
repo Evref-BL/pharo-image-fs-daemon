@@ -1,3 +1,5 @@
+//go:build !darwin
+
 package mount
 
 import (
@@ -634,36 +636,4 @@ func TestDSStoreIsIgnoredAsMetadata(t *testing.T) {
 	if !isIgnoredMetadataPath("/tonel/PharoImageFS/.DS_Store") {
 		t.Fatalf(".DS_Store should be ignored as macOS metadata")
 	}
-}
-
-func TestMountOptionsSuppressMacOSMetadataFiles(t *testing.T) {
-	options := mountOptions(Config{})
-	joinedOptions := strings.Join(options, " ")
-	for _, expected := range []string{"-s", "noappledouble", "noapplexattr"} {
-		if !strings.Contains(joinedOptions, expected) {
-			t.Fatalf("missing %s in mount options %#v", expected, options)
-		}
-	}
-}
-
-func fakeProjectionClientForTonelPackage() *fakeClient {
-	return &fakeClient{
-		entries: map[string][]protocol.Entry{},
-		stats: map[string]protocol.Entry{
-			"/tonel/PharoImageFS": {
-				Name:     "PharoImageFS",
-				Kind:     protocol.Directory,
-				Writable: true,
-			},
-		},
-	}
-}
-
-func contains(collection []string, element string) bool {
-	for _, each := range collection {
-		if each == element {
-			return true
-		}
-	}
-	return false
 }

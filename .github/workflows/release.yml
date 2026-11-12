@@ -40,9 +40,6 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Install fuse-t headers
-        run: brew install --cask fuse-t
-
       - name: Build
         run: go build -trimpath -ldflags="-s -w" -o dist/pharo-image-fs ./cmd/pharo-image-fs
 

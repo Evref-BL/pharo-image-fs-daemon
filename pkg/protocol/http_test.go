@@ -2,9 +2,13 @@ package protocol
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestHTTPClientListPostsProjectionPath(t *testing.T) {
@@ -198,5 +202,81 @@ func TestHTTPClientRmdirPostsProjectionPath(t *testing.T) {
 
 	if err := client.Rmdir(t.Context(), "/tonel/OldPackage"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// zincListener accepts as Zinc's ZnManagingMultiThreadedServer does: past 32
+// open connections it answers 503 and closes, before reading a request.
+type zincListener struct {
+	net.Listener
+	active atomic.Int64
+	opened atomic.Int64
+}
+
+type zincConnection struct {
+	net.Conn
+	once     sync.Once
+	listener *zincListener
+}
+
+func (c *zincConnection) Close() error {
+	c.once.Do(func() { c.listener.active.Add(-1) })
+	return c.Conn.Close()
+}
+
+func (l *zincListener) Accept() (net.Conn, error) {
+	for {
+		connection, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		l.opened.Add(1)
+		if l.active.Load() >= 32 {
+			_, _ = connection.Write([]byte("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"))
+			_ = connection.Close()
+			continue
+		}
+		l.active.Add(1)
+		return &zincConnection{Conn: connection, listener: l}, nil
+	}
+}
+
+func TestHTTPClientStaysUnderZincsConnectionCap(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &zincListener{Listener: inner}
+	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		time.Sleep(2 * time.Millisecond)
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"entry":{"name":"Tonel","kind":"directory"}}`))
+	})}
+	go func() { _ = server.Serve(listener) }()
+	defer server.Close()
+
+	client, err := NewHTTPClient("http://" + inner.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failures atomic.Int64
+	var callers sync.WaitGroup
+	for range 64 {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			for range 20 {
+				if _, err := client.Stat(t.Context(), "/tonel"); err != nil {
+					failures.Add(1)
+				}
+			}
+		}()
+	}
+	callers.Wait()
+	if failures.Load() != 0 {
+		t.Fatalf("%d of %d calls failed", failures.Load(), 64*20)
+	}
+	if opened := listener.opened.Load(); opened > maxImageConnections {
+		t.Fatalf("opened %d connections, more than %d", opened, maxImageConnections)
 	}
 }
