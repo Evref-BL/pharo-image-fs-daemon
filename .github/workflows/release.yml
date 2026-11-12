@@ -27,6 +27,17 @@ jobs:
             asset: pharo-image-fs-daemon-darwin-arm64
           - runner: macos-26-intel
             asset: pharo-image-fs-daemon-darwin-amd64
+          # Static: a Linux user needs fusermount3, and nothing else.
+          - runner: ubuntu-24.04
+            asset: pharo-image-fs-daemon-linux-amd64
+            goos: linux
+            goarch: amd64
+            cgo: "0"
+          - runner: ubuntu-24.04
+            asset: pharo-image-fs-daemon-linux-arm64
+            goos: linux
+            goarch: arm64
+            cgo: "0"
 
     steps:
       - name: Checkout
@@ -41,7 +52,15 @@ jobs:
           cache: false
 
       - name: Build
-        run: go build -trimpath -ldflags="-s -w" -o dist/pharo-image-fs ./cmd/pharo-image-fs
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          go build -trimpath -ldflags="-s -w" -o dist/pharo-image-fs ./cmd/pharo-image-fs
+          if [ "${{ matrix.cgo }}" = "0" ]; then
+            go version -m dist/pharo-image-fs | grep -q 'CGO_ENABLED=0'
+          fi
 
       - name: Package
         run: |
@@ -59,7 +78,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Download artifacts
