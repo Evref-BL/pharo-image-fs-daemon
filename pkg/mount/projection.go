@@ -163,8 +163,7 @@ func (p *projection) unlink(projectionPath string) syscall.Errno {
 		if protocol.NotFound(err) {
 			return 0
 		}
-		p.logf("delete %s failed: %v", projectionPath, err)
-		return errnoFor(err)
+		return p.refused("delete", projectionPath, err)
 	}
 	return 0
 }
@@ -177,8 +176,7 @@ func (p *projection) mkdir(projectionPath string) syscall.Errno {
 		return syscall.EROFS
 	}
 	if err := p.client.Mkdir(context.Background(), projectionPath); err != nil {
-		p.logf("mkdir %s failed: %v", projectionPath, err)
-		return errnoFor(err)
+		return p.refused("mkdir", projectionPath, err)
 	}
 	return 0
 }
@@ -191,8 +189,7 @@ func (p *projection) rmdir(projectionPath string) syscall.Errno {
 		return syscall.EROFS
 	}
 	if err := p.client.Rmdir(context.Background(), projectionPath); err != nil {
-		p.logf("rmdir %s failed: %v", projectionPath, err)
-		return errnoFor(err)
+		return p.refused("rmdir", projectionPath, err)
 	}
 	return 0
 }
@@ -237,8 +234,7 @@ func (p *projection) rename(oldPath string, newPath string) syscall.Errno {
 		return syscall.EROFS
 	}
 	if err := p.client.Rename(context.Background(), oldPath, newPath); err != nil {
-		p.logf("rename %s to %s failed: %v", oldPath, newPath, err)
-		return errnoFor(err)
+		return p.refused("rename", oldPath+" to "+newPath, err)
 	}
 	return 0
 }
@@ -249,8 +245,7 @@ func (p *projection) rename(oldPath string, newPath string) syscall.Errno {
 func (p *projection) writeProjection(ctx context.Context, projectionPath string, contents []byte) error {
 	result, err := p.client.Write(ctx, projectionPath, contents)
 	if err != nil {
-		p.logf("write %s failed: %v", projectionPath, err)
-		p.errors.RecordWriteError(projectionPath, err)
+		p.refused("write", projectionPath, err)
 		return err
 	}
 
@@ -279,6 +274,14 @@ func (p *projection) logDiagnostics(projectionPath string, diagnostics []protoco
 	for _, diagnostic := range diagnostics {
 		p.logf("diagnostic %s: %s", diagnostic.Rule, diagnosticLineFor(diagnostic))
 	}
+}
+
+// refused logs and records in /errors that the image refused operation on
+// what, and answers its errno.
+func (p *projection) refused(operation string, what string, err error) syscall.Errno {
+	p.logf("%s %s failed: %v", operation, what, err)
+	p.errors.RecordError(operation, what, err)
+	return errnoFor(err)
 }
 
 func (p *projection) logf(format string, args ...any) {

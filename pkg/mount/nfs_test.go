@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1471,5 +1472,94 @@ func TestNFSReadsDropWhatAChangeMadeStale(t *testing.T) {
 		if got := readAsNFS(t, fsys, objectPath); got[:1] != page {
 			t.Fatalf("held writes should read as written, read %q", got[:8])
 		}
+	}
+}
+
+func TestNFSARefusedSaveOntoABackedUpClassShowsItAgain(t *testing.T) {
+	// JetBrains' safe write: the class goes to a backup name, then a temp file
+	// is renamed over it.
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	temp := "/tonel/Kernel/Object.class.st___jb_tmp___"
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := writeNFS(fsys, temp, "syntax error", 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := fsys.Rename(objectPath, "/tonel/Kernel/Object.class.st___jb_old___"); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if err := fsys.Rename(temp, objectPath); err == nil {
+		t.Fatalf("the image should refuse the save")
+	}
+	if got := readAsNFS(t, fsys, objectPath); got != "old source" {
+		t.Fatalf("the class the image still has should show again, read %q", got)
+	}
+	listed, err := fsys.ReadDir("/tonel/Kernel")
+	if err != nil || !containsInfoNamed(listed, "Object.class.st") {
+		t.Fatalf("the class should be listed again, got %v %v", namesOf(listed), err)
+	}
+}
+
+// refusingChangesClient refuses every change but a compile, as an image does
+// in a package no repository owns.
+type refusingChangesClient struct {
+	*memoryClient
+}
+
+func (c *refusingChangesClient) Delete(context.Context, string) error {
+	return &protocol.Error{StatusCode: http.StatusBadRequest, Message: "Package is not owned by a repository"}
+}
+
+func (c *refusingChangesClient) Rename(context.Context, string, string) error {
+	return &protocol.Error{StatusCode: http.StatusBadRequest, Message: "Package is not owned by a repository"}
+}
+
+func (c *refusingChangesClient) Mkdir(context.Context, string) error {
+	return &protocol.Error{StatusCode: http.StatusBadRequest, Message: "Package is not owned by a repository"}
+}
+
+func (c *refusingChangesClient) Rmdir(context.Context, string) error {
+	return &protocol.Error{StatusCode: http.StatusBadRequest, Message: "Package is not owned by a repository"}
+}
+
+func TestNFSEveryRefusalIsRecorded(t *testing.T) {
+	fsys := newNFSFileSystem(&refusingChangesClient{newMemoryClient(map[string]string{objectPath: "source"})})
+	changes := map[string]func() error{
+		"delete": func() error { return fsys.Remove(objectPath) },
+		"rename": func() error { return fsys.Rename(objectPath, "/tonel/Kernel/Renamed.class.st") },
+		"mkdir":  func() error { return fsys.MkdirAll("/tonel/Added", 0o755) },
+		"rmdir":  func() error { return fsys.Remove("/tonel/Kernel") },
+	}
+	for operation, change := range changes {
+		if err := change(); err == nil {
+			t.Fatalf("the image should refuse the %s", operation)
+		}
+		latest := readAsNFS(t, fsys, "/errors/"+latestErrorName)
+		if !strings.Contains(latest, "Operation: "+operation) || !strings.Contains(latest, "not owned by a repository") {
+			t.Fatalf("latest.txt should tell the refused %s, read %q", operation, latest)
+		}
+		listed, err := fsys.ReadDir("/errors")
+		if err != nil {
+			t.Fatalf("readdir: %v", err)
+		}
+		named := false
+		for _, name := range namesOf(listed) {
+			named = named || strings.HasSuffix(name, "-"+operation+".txt")
+		}
+		if !named {
+			t.Fatalf("/errors should name the refused %s, lists %v", operation, namesOf(listed))
+		}
+	}
+}
+
+func TestNohupKeepsTheDaemonPastItsTerminal(t *testing.T) {
+	hangUp := os.Signal(syscall.SIGHUP)
+	if slices.Contains(stopSignalsUnless(func(each os.Signal) bool { return each == hangUp }), hangUp) {
+		t.Fatalf("an ignored SIGHUP should not stop the daemon")
+	}
+	if !slices.Contains(stopSignalsUnless(func(os.Signal) bool { return false }), hangUp) {
+		t.Fatalf("SIGHUP should stop a daemon that does not ignore it")
 	}
 }

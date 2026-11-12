@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"syscall"
 	"time"
 
@@ -69,4 +70,19 @@ func ensureMountPoint(mountPoint string) error {
 	}
 
 	return nil
+}
+
+// stopSignals answers the signals that stop the daemon: SIGHUP only when it
+// is not ignored, as nohup has it ignored to keep the daemon past its
+// terminal.
+func stopSignals() []os.Signal {
+	return stopSignalsUnless(signal.Ignored)
+}
+
+func stopSignalsUnless(ignored func(os.Signal) bool) []os.Signal {
+	stop := []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+	if !ignored(syscall.SIGHUP) {
+		stop = append(stop, syscall.SIGHUP)
+	}
+	return stop
 }

@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestMountedProjection mounts a projection with the system's mount_nfs, as
@@ -43,9 +45,17 @@ func TestMountedProjection(t *testing.T) {
 	if output, err := exec.Command("/sbin/mount_nfs", arguments...).CombinedOutput(); err != nil {
 		t.Fatalf("mount_nfs %v: %v: %s", arguments, err, output)
 	}
+	realMountPoint, err := filepath.EvalSymlinks(mountPoint)
+	if err != nil {
+		t.Fatalf("mount point: %v", err)
+	}
+	mounted, ok := mountedAt(realMountPoint)
+	if !ok || unix.ByteSliceToString(mounted.Fstypename[:]) != "nfs" {
+		t.Fatalf("the mount table should show an NFS mount at %s", realMountPoint)
+	}
 	defer func() {
-		unmount(mountPoint, log.New(io.Discard, "", 0))
-		if isMounted(mountPoint) {
+		unmount(realMountPoint, mounted.Fsid, log.New(io.Discard, "", 0))
+		if isMountedWith(realMountPoint, mounted.Fsid) {
 			t.Errorf("still mounted after unmount")
 		}
 	}()
@@ -211,4 +221,20 @@ func TestMountedProjection(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestTheMountTableAnswersWhatIsMountedWhere(t *testing.T) {
+	root, ok := mountedAt("/")
+	if !ok {
+		t.Fatalf("the mount table should show the root file system")
+	}
+	if !isMountedWith("/", root.Fsid) {
+		t.Fatalf("the root should be mounted with its own fsid")
+	}
+	if isMountedWith("/", unix.Fsid{Val: [2]int32{root.Fsid.Val[0] + 1, root.Fsid.Val[1]}}) {
+		t.Fatalf("another file system's fsid should not be taken for the one at /")
+	}
+	if _, ok := mountedAt(t.TempDir()); ok {
+		t.Fatalf("a plain directory should not be a mount point")
+	}
 }

@@ -36,14 +36,16 @@ func NewErrorStore() *ErrorStore {
 	return &ErrorStore{}
 }
 
-func (s *ErrorStore) RecordWriteError(projectionPath string, err error) {
+// RecordError records that the image refused operation (write, delete,
+// rename, mkdir, rmdir) on projectionPath.
+func (s *ErrorStore) RecordError(operation string, projectionPath string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.last = max(time.Now().UnixMilli(), s.last+1)
 	entry := errorEntry{
-		name:     time.UnixMilli(s.last).Format("2006-01-02T15-04-05.000") + "-write.txt",
-		contents: []byte(writeErrorTextFor(projectionPath, err)),
+		name:     time.UnixMilli(s.last).Format("2006-01-02T15-04-05.000") + "-" + operation + ".txt",
+		contents: []byte(errorTextFor(operation, projectionPath, err)),
 		modified: s.last,
 	}
 	s.entries = append([]errorEntry{entry}, s.entries...)
@@ -125,14 +127,15 @@ func (s *ErrorStore) Read(projectionPath string) ([]byte, bool) {
 	return nil, false
 }
 
-func writeErrorTextFor(projectionPath string, err error) string {
+func errorTextFor(operation string, projectionPath string, err error) string {
 	message := "unknown error"
 	if err != nil {
 		message = err.Error()
 	}
 
 	return fmt.Sprintf(
-		"Operation: write\nPath: %s\nImage changed: no\n\n%s\n",
+		"Operation: %s\nPath: %s\nImage changed: no\n\n%s\n",
+		operation,
 		projectionPath,
 		strings.TrimSpace(message))
 }

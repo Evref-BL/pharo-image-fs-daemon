@@ -356,7 +356,7 @@ func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 	fsys.keepOff(oldPath, newPath)
 
 	if err := fsys.commitHeld(oldPath); err != nil {
-		fsys.showRemovedClass(newPath)
+		fsys.showHiddenClass(newPath)
 		return err
 	}
 	fsys.mu.Lock()
@@ -372,7 +372,7 @@ func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 	fsys.namespaceChanged(oldPath)
 	fsys.namespaceChanged(newPath)
 	if errno != 0 {
-		fsys.showRemovedClass(newPath)
+		fsys.showHiddenClass(newPath)
 		return pathError("rename", newPath, errno)
 	}
 	fsys.ids.renamed(oldPath, newPath)
@@ -402,18 +402,17 @@ func (fsys *nfsFileSystem) sillyRename(oldPath string, newPath string) syscall.E
 	return 0
 }
 
-// showRemovedClass shows the class at projectionPath again, when its file was
-// removed while open and what was to take the name failed: the image still
-// has it, as a refused rename save leaves it.
-func (fsys *nfsFileSystem) showRemovedClass(projectionPath string) {
-	for _, original := range fsys.silly {
-		if original == projectionPath && fsys.overlay.IsHidden(projectionPath) {
-			fsys.overlay.Delete(projectionPath)
-			fsys.namespaceChanged(projectionPath)
-			fsys.forgetSilly(projectionPath)
-			return
-		}
+// showHiddenClass shows the class at projectionPath again when what was to
+// take its name failed: an editor's backup rename, or the client's rename of
+// an open file to ".nfs…", hid it, and the image still has it, as a refused
+// save leaves it.
+func (fsys *nfsFileSystem) showHiddenClass(projectionPath string) {
+	if !fsys.overlay.IsHidden(projectionPath) {
+		return
 	}
+	fsys.overlay.Delete(projectionPath)
+	fsys.namespaceChanged(projectionPath)
+	fsys.forgetSilly(projectionPath)
 }
 
 // forgetSilly drops the ".nfs…" files that stand for the class at
@@ -451,7 +450,7 @@ func (fsys *nfsFileSystem) Remove(name string) error {
 		// refusal is recorded in /errors, and the class shows again.
 		if err := fsys.client.Delete(context.Background(), original); err != nil && !protocol.NotFound(err) {
 			fsys.logf("delete %s failed: %v", original, err)
-			fsys.errors.RecordWriteError(original, err)
+			fsys.errors.RecordError("delete", original, err)
 		}
 		fsys.overlay.Delete(original)
 		fsys.namespaceChanged(original)
