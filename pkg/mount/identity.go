@@ -44,15 +44,6 @@ func (i *identities) idFor(projectionPath string) uint64 {
 	return id
 }
 
-// idAt answers the id of what is at projectionPath, if it has one.
-func (i *identities) idAt(projectionPath string) (uint64, bool) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-
-	id, ok := i.ids[projectionPath]
-	return id, ok
-}
-
 // pathFor answers where what id names is now, if it still is.
 func (i *identities) pathFor(id uint64) (string, bool) {
 	i.mu.Lock()

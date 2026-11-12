@@ -4,13 +4,13 @@ go 1.26
 
 require (
 	github.com/go-git/go-billy/v5 v5.6.0
+	github.com/hanwen/go-fuse/v2 v2.12.1
 	github.com/willscott/go-nfs v0.0.4
 	github.com/winfsp/cgofuse v1.6.0
 	golang.org/x/sys v0.28.0
 )
 
 require (
-	github.com/hanwen/go-fuse/v2 v2.12.1 // indirect
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93 // indirect
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 )

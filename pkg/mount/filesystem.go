@@ -80,7 +80,9 @@ type fileSystem struct {
 	stats    uint64
 	listings map[string]listing
 	reads    map[string]cachedRead
-	last     time.Time
+	// swept is when reads last lost the renderings too old to serve.
+	swept time.Time
+	last  time.Time
 }
 
 func newFileSystem(client protocol.Client) *fileSystem {
@@ -138,16 +140,7 @@ func (fsys *fileSystem) peekAt(projectionPath string) (protocol.Entry, time.Time
 	}
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
-	modified := fsys.started
-	if changed, ok := fsys.changed[projectionPath]; ok && changed.After(modified) {
-		modified = changed
-	}
-	if entry.Modified > 0 {
-		if reported := time.UnixMilli(entry.Modified); reported.After(modified) {
-			modified = reported
-		}
-	}
-	return entry, modified, 0
+	return entry, fsys.fileTimeLocked(projectionPath, entry), 0
 }
 
 // statAt answers the entry at projectionPath and when it last changed. It
@@ -330,7 +323,18 @@ func (fsys *fileSystem) contentsToRead(projectionPath string, entry protocol.Ent
 	fsys.mu.Lock()
 	_, heldNow := fsys.pending[projectionPath]
 	if !heldNow && !wasBusy && !fsys.isBusyLocked(projectionPath) && fsys.markLocked(projectionPath) == mark {
-		fsys.reads[projectionPath] = cachedRead{contents: contents, read: time.Now(), size: entry.Size, modified: entry.Modified}
+		// A rendering serves nothing once a second old, so a walk over the
+		// image must not keep every class it read.
+		now := time.Now()
+		if now.Sub(fsys.swept) >= readFreshness {
+			for cachedPath, cached := range fsys.reads {
+				if now.Sub(cached.read) >= readFreshness {
+					delete(fsys.reads, cachedPath)
+				}
+			}
+			fsys.swept = now
+		}
+		fsys.reads[projectionPath] = cachedRead{contents: contents, read: now, size: entry.Size, modified: entry.Modified}
 	}
 	fsys.mu.Unlock()
 	return contents, nil
@@ -365,6 +369,13 @@ func (fsys *fileSystem) modificationTime(projectionPath string, entry protocol.E
 		fsys.seen[projectionPath] = seenEntry{size: entry.Size, modified: entry.Modified, stat: fsys.stats}
 	}
 
+	return fsys.fileTimeLocked(projectionPath, entry), true
+}
+
+// fileTimeLocked answers when the file at projectionPath last changed: the
+// latest of the mount's start, the last change seen, and what the image
+// reports. The caller holds mu.
+func (fsys *fileSystem) fileTimeLocked(projectionPath string, entry protocol.Entry) time.Time {
 	modified := fsys.started
 	if changed, ok := fsys.changed[projectionPath]; ok && changed.After(modified) {
 		modified = changed
@@ -374,7 +385,7 @@ func (fsys *fileSystem) modificationTime(projectionPath string, entry protocol.E
 			modified = reported
 		}
 	}
-	return modified, true
+	return modified
 }
 
 // directoryTime answers when the listing of the directory at projectionPath
@@ -438,11 +449,16 @@ func (fsys *fileSystem) unlinkFile(projectionPath string) syscall.Errno {
 	return fsys.unlink(projectionPath)
 }
 
-// renamedOver records that a rename took newPath, and left oldPath. The
+// renamedOver records that a rename took newPath, and left oldPath: what was
+// held for the file it replaced goes with that file, and the id moves. The
 // caller holds changing.
 func (fsys *fileSystem) renamedOver(oldPath string, newPath string) {
+	fsys.mu.Lock()
+	delete(fsys.pending, newPath)
+	fsys.mu.Unlock()
 	delete(fsys.overBackup, oldPath)
 	delete(fsys.overBackup, newPath)
+	fsys.ids.renamed(oldPath, newPath)
 }
 
 // showHiddenClass shows the class at projectionPath again when what was to
@@ -589,10 +605,14 @@ func (fsys *fileSystem) lockChangeOf(op string, file openFile) (string, error) {
 	return projectionPath, nil
 }
 
-// writeLocked writes data at offset into the file at projectionPath: into
-// its held writes, which start from base when it is not nil and from what
-// the image has otherwise, or into the editor's file in the overlay. The
-// caller holds changing.
+// atTheEnd is the offset of a write that appends: the end the file has when
+// the write lands, which the kernel's size may not know.
+const atTheEnd = -1
+
+// writeLocked writes data at offset, or atTheEnd, into the file at
+// projectionPath: into its held writes, which start from base when it is not
+// nil and from what the image has otherwise, or into the editor's file in the
+// overlay. The caller holds changing.
 func (fsys *fileSystem) writeLocked(projectionPath string, data []byte, offset int64, base []byte) error {
 	kind, errno := fsys.writeKind(projectionPath)
 	if errno != 0 {
@@ -604,17 +624,33 @@ func (fsys *fileSystem) writeLocked(projectionPath string, data []byte, offset i
 		if !ok {
 			return pathError("write", projectionPath, syscall.ENOENT)
 		}
+		if offset == atTheEnd {
+			if offset = int64(len(contents)); offset+int64(len(data)) > maxFileSize {
+				return pathError("write", projectionPath, syscall.EFBIG)
+			}
+		}
 		_ = fsys.overlay.Write(context.Background(), projectionPath, patched(contents, data, offset))
 		fsys.contentsChanged(projectionPath)
 		return nil
 	}
 
+	fsys.mu.Lock()
+	_, wasHeld := fsys.pending[projectionPath]
+	fsys.mu.Unlock()
 	if err := fsys.hold(projectionPath, base); err != nil {
 		return err
 	}
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 	if held, ok := fsys.pending[projectionPath]; ok {
+		if offset == atTheEnd {
+			if offset = int64(len(held.contents)); offset+int64(len(data)) > maxFileSize {
+				if !wasHeld {
+					delete(fsys.pending, projectionPath)
+				}
+				return pathError("write", projectionPath, syscall.EFBIG)
+			}
+		}
 		held.write(data, offset)
 	}
 	return nil

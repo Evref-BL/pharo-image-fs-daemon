@@ -1563,3 +1563,39 @@ func TestNohupKeepsTheDaemonPastItsTerminal(t *testing.T) {
 		t.Fatalf("SIGHUP should stop a daemon that does not ignore it")
 	}
 }
+
+// A walk over the image reads every class once; the renderings it leaves
+// serve nothing a second later, so they must not stay.
+func TestTheReadCacheKeepsOnlyWhatItCanServe(t *testing.T) {
+	files := map[string]string{objectPath: "source"}
+	for i := range 200 {
+		files["/tonel/Kernel/C"+strings.Repeat("x", i)+".class.st"] = "source"
+	}
+	fsys := newFileSystem(newMemoryClient(files))
+	read := func(projectionPath string) {
+		entry, errno := fsys.entryFor(projectionPath)
+		if errno != 0 {
+			t.Fatalf("%s: %v", projectionPath, errno)
+		}
+		if _, err := fsys.contentsToRead(projectionPath, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for projectionPath := range files {
+		read(projectionPath)
+	}
+	fsys.mu.Lock()
+	for projectionPath, cached := range fsys.reads {
+		cached.read = cached.read.Add(-2 * readFreshness)
+		fsys.reads[projectionPath] = cached
+	}
+	fsys.swept = fsys.swept.Add(-2 * readFreshness)
+	fsys.mu.Unlock()
+
+	read(objectPath)
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	if len(fsys.reads) != 1 {
+		t.Fatalf("the cache should keep only the last rendering, keeps %d", len(fsys.reads))
+	}
+}
