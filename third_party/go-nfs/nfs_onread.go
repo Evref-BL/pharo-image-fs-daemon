@@ -1,10 +1,15 @@
 package nfs
 
+// Changed for pharo-image-fs: an offset past 2^63 answers INVAL, the
+// attributes are taken before the data, and an error from the file system
+// keeps its errno's meaning (see pifs.go), STALE included.
+
 import (
 	"bytes"
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -32,28 +37,37 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
+	if obj.Offset > math.MaxInt64 {
+		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+	}
 	fs, path, err := userHandle.FromHandle(obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
 
-	fh, err := fs.Open(fs.Join(path...))
+	// The attributes come before the data: a change between the two then
+	// pairs new data with old attributes, which the client sees change and
+	// reads again, never old data with new ones, which it would keep.
+	fullPath := fs.Join(path...)
+	info, err := fs.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
+	}
+
+	fh, err := fs.Open(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &NFSStatusError{NFSStatusNoEnt, err}
+		}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 	}
 	defer fh.Close()
 
 	resp := nfsReadResponse{}
 	setEOF := false
-
-	fullPath := fs.Join(path...)
-	info, err := fs.Stat(fullPath)
-	if err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
 	if int64(obj.Offset) >= info.Size() {
 		obj.Count = 0
 		setEOF = true
@@ -68,7 +82,7 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	// todo: multiple reads if size isn't full
 	cnt, err := fh.ReadAt(resp.Data, int64(obj.Offset))
 	if err != nil && !errors.Is(err, io.EOF) {
-		return &NFSStatusError{NFSStatusIO, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
 	}
 	resp.Count = uint32(cnt)
 	resp.Data = resp.Data[:resp.Count]

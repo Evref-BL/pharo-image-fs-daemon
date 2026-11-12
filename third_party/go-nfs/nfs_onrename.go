@@ -1,5 +1,8 @@
 package nfs
 
+// Changed for pharo-image-fs: an error from the file system keeps its errno's
+// meaning (see pifs.go), STALE included.
+
 import (
 	"bytes"
 	"context"
@@ -51,7 +54,7 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}
-		return &NFSStatusError{NFSStatusIO, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
 	}
 	if !fromDirInfo.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, nil}
@@ -64,7 +67,7 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}
-		return &NFSStatusError{NFSStatusIO, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
 	}
 	if !toDirInfo.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, nil}

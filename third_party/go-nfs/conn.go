@@ -1,5 +1,13 @@
 package nfs
 
+// Changed for pharo-image-fs: from go-nfs's main branch (3946bf8), the
+// PROG_MISMATCH reply code, which shifted every code after it, and concurrent
+// handlers. A panic in a handler is answered through Server.PanicHandler,
+// after the open upstream PR #151, and one outside a handler closes the
+// connection. A reply that cannot be sent ends the connection, so no handler
+// waits for good to queue its own. An unknown procedure is logged at debug
+// level.
+
 import (
 	"bufio"
 	"bytes"
@@ -9,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
@@ -29,6 +38,7 @@ type ResponseCode uint32
 const (
 	ResponseCodeSuccess ResponseCode = iota
 	ResponseCodeProgUnavailable
+	ResponseCodeProgMismatch
 	ResponseCodeProcUnavailable
 	ResponseCodeGarbageArgs
 	ResponseCodeSystemErr
@@ -42,11 +52,23 @@ type conn struct {
 	net.Conn
 }
 
+// maxRequestFragmentBytes rejects implausible record-marking lengths before a
+// request body is buffered for concurrent handling. Linux caps rsize and
+// wsize at 1 MiB, so real requests stay well under this.
+const maxRequestFragmentBytes = 16 << 20
+
 func (c *conn) serve(ctx context.Context) {
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer c.recoverConnection()
+
+	if c.Server.ConcurrentHandlers > 1 {
+		c.serveConcurrently(connCtx, cancel, c.Server.ConcurrentHandlers)
+		return
+	}
+
 	c.writeSerializer = make(chan []byte, 1)
-	go c.serializeWrites(connCtx)
+	go c.serializeWrites(connCtx, cancel)
 
 	bio := bufio.NewReader(c.Conn)
 	for {
@@ -76,7 +98,90 @@ func (c *conn) serve(ctx context.Context) {
 	}
 }
 
-func (c *conn) serializeWrites(ctx context.Context) {
+// serveConcurrently handles up to limit requests from the connection at once.
+// Linux clients multiplex every process's I/O on a mount over one TCP
+// connection, so handling requests one at a time lets a single slow
+// operation stall the whole mount. RPC replies carry the request's XID, so
+// completing them out of order is legal.
+//
+// Each request body is read into memory before its handler starts, so the
+// loop can read the next request while earlier ones are still running.
+func (c *conn) serveConcurrently(ctx context.Context, cancel context.CancelFunc, limit int) {
+	c.writeSerializer = make(chan []byte, limit)
+	go c.serializeWrites(ctx, cancel)
+
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	// Runs before the wait: handlers waiting to queue a reply return.
+	defer cancel()
+
+	bio := bufio.NewReader(c.Conn)
+	for {
+		w, err := c.readRequestHeader(ctx, bio)
+		if err != nil {
+			// A clean close, or a request that can't be framed: either way
+			// nothing more can be read from this connection.
+			c.Close()
+			return
+		}
+		Log.Tracef("request: %v", w.req)
+		if err := w.bufferBody(); err != nil {
+			Log.Errorf("error reading request body: %v", err)
+			c.Close()
+			return
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			c.Close()
+			return
+		}
+		wg.Add(1)
+		go func(w *response) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer c.recoverConnection()
+
+			err := c.handle(ctx, w)
+			respErr := w.finish(ctx)
+			if err != nil {
+				Log.Errorf("error handling req: %v", err)
+				// failure to handle at a level needing to close the connection.
+				cancel()
+				c.Close()
+				return
+			}
+			if respErr != nil && respErr != context.Canceled {
+				Log.Errorf("error sending response: %v", respErr)
+				cancel()
+				c.Close()
+			}
+		}(w)
+	}
+}
+
+// recoverConnection closes the connection on a panic outside a handler, which
+// handle does not answer: the client reconnects, and the server goes on.
+func (c *conn) recoverConnection() {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	if ph := c.Server.PanicHandler; ph != nil {
+		ph(recovered)
+	}
+	c.Close()
+}
+
+func (c *conn) serializeWrites(ctx context.Context, cancel context.CancelFunc) {
+	// A reply that cannot be sent ends the connection: handlers waiting to
+	// queue theirs return, instead of blocking once the queue is full.
+	defer func() {
+		cancel()
+		c.Close()
+	}()
 	// todo: maybe don't need the extra buffer
 	writer := bufio.NewWriter(c.Conn)
 	var fragmentBuf [4]byte
@@ -116,13 +221,23 @@ func (c *conn) serializeWrites(ctx context.Context) {
 func (c *conn) handle(ctx context.Context, w *response) error {
 	handler := c.Server.handlerFor(w.req.Header.Prog, w.req.Header.Proc)
 	if handler == nil {
-		Log.Errorf("No handler for %d.%d", w.req.Header.Prog, w.req.Header.Proc)
+		Log.Debugf("No handler for %d.%d", w.req.Header.Prog, w.req.Header.Proc)
 		if err := w.drain(ctx); err != nil {
 			return err
 		}
 		return c.err(ctx, w, &ResponseCodeProcUnavailableError{})
 	}
-	appError := handler(ctx, w, c.Server.Handler)
+	var appError error
+	func() {
+		if ph := c.Server.PanicHandler; ph != nil {
+			defer func() {
+				if r := recover(); r != nil {
+					appError = &panicAppError{code: ph(r)}
+				}
+			}()
+		}
+		appError = handler(ctx, w, c.Server.Handler)
+	}()
 	if drainErr := w.drain(ctx); drainErr != nil {
 		return drainErr
 	}
@@ -250,6 +365,25 @@ func (w *response) Write(dat []byte) error {
 	return nil
 }
 
+// bufferBody reads the rest of the request frame into memory, so the
+// connection can go on to read the next request while this one is handled.
+// The handler sees the same io.LimitedReader as before.
+func (w *response) bufferBody() error {
+	lr, ok := w.req.Body.(*io.LimitedReader)
+	if !ok {
+		return io.ErrUnexpectedEOF
+	}
+	var buf []byte
+	if lr.N > 0 {
+		buf = make([]byte, lr.N)
+	}
+	if _, err := io.ReadFull(lr, buf); err != nil {
+		return err
+	}
+	w.req.Body = &io.LimitedReader{R: bytes.NewReader(buf), N: int64(len(buf))}
+	return nil
+}
+
 // drain reads the rest of the request frame if not consumed by the handler.
 func (w *response) drain(ctx context.Context) error {
 	if reader, ok := w.req.Body.(*io.LimitedReader); ok {
@@ -290,7 +424,7 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, ErrInputInvalid
 	}
 	reqLen := fragment - uint32(1<<31)
-	if reqLen < 40 {
+	if reqLen < 40 || reqLen > maxRequestFragmentBytes {
 		return nil, ErrInputInvalid
 	}
 

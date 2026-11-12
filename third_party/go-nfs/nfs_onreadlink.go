@@ -1,5 +1,8 @@
 package nfs
 
+// Changed for pharo-image-fs: an error from the file system keeps its errno's
+// meaning (see pifs.go), STALE included.
+
 import (
 	"bytes"
 	"context"
@@ -30,7 +33,7 @@ func onReadLink(ctx context.Context, w *response, userHandle Handler) error {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}
 
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 	}
 
 	writer := bytes.NewBuffer([]byte{})

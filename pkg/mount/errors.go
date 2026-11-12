@@ -20,11 +20,16 @@ const (
 type ErrorStore struct {
 	mu      sync.Mutex
 	entries []errorEntry
+	last    int64
 }
 
+// errorEntry is a recorded refusal. Its time, in milliseconds, moves with each
+// one, so a client that has latest.txt cached sees the next refusal even when
+// it is as long as the last.
 type errorEntry struct {
 	name     string
 	contents []byte
+	modified int64
 }
 
 func NewErrorStore() *ErrorStore {
@@ -35,9 +40,12 @@ func (s *ErrorStore) RecordWriteError(projectionPath string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
+	s.last = max(now.UnixMilli(), s.last+1)
 	entry := errorEntry{
-		name:     time.Now().Format("2006-01-02T15-04-05") + "-write.txt",
+		name:     now.Format("2006-01-02T15-04-05") + "-write.txt",
 		contents: []byte(writeErrorTextFor(projectionPath, err)),
+		modified: s.last,
 	}
 	s.entries = append([]errorEntry{entry}, s.entries...)
 	if len(s.entries) > maxErrorEntries {
@@ -56,11 +64,11 @@ func (s *ErrorStore) Stat(projectionPath string) (protocol.Entry, bool) {
 		if len(s.entries) == 0 {
 			return protocol.Entry{}, false
 		}
-		return protocol.Entry{Name: latestErrorName, Kind: protocol.File, Size: uint64(len(s.entries[0].contents))}, true
+		return protocol.Entry{Name: latestErrorName, Kind: protocol.File, Size: uint64(len(s.entries[0].contents)), Modified: s.entries[0].modified}, true
 	default:
 		for _, entry := range s.entries {
 			if projectionPath == errorsRoot+"/"+entry.name {
-				return protocol.Entry{Name: entry.name, Kind: protocol.File, Size: uint64(len(entry.contents))}, true
+				return protocol.Entry{Name: entry.name, Kind: protocol.File, Size: uint64(len(entry.contents)), Modified: entry.modified}, true
 			}
 		}
 		return protocol.Entry{}, false

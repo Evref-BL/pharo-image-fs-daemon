@@ -1,7 +1,8 @@
 package nfs
 
 // This copy of go-nfs v0.0.4 is patched for pharo-image-fs, where a write
-// compiles the file it writes:
+// compiles the file it writes. Each file it changes says how at its top; the
+// changes this file adds are:
 //
 //   - A file system implementing Committer can hold writes until they make a
 //     whole file, and commit them then: a client does not tell the writer
@@ -9,7 +10,8 @@ package nfs
 //   - ACCESS no longer grants modification of an object whose mode has no
 //     owner write bit.
 //   - Errors carrying a syscall.Errno keep their meaning (EROFS, ENOENT,
-//     EEXIST, ENOTDIR, EISDIR, ENOTEMPTY, EINVAL, ENOTSUP) instead of
+//     EEXIST, ENOTDIR, EISDIR, ENOTEMPTY, EINVAL, ENOTSUP, EFBIG,
+//     ESTALE) instead of
 //     becoming IO or ACCESS.
 
 import (
@@ -55,6 +57,10 @@ func statusFromError(err error, fallback NFSStatus) NFSStatus {
 		return NFSStatusIO
 	case syscall.ENOTSUP:
 		return NFSStatusNotSupp
+	case syscall.EFBIG:
+		return NFSStatusFBig
+	case syscall.ESTALE:
+		return NFSStatusStale
 	default:
 		return fallback
 	}

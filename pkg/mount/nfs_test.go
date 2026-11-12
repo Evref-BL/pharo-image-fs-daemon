@@ -16,6 +16,7 @@ import (
 
 	"github.com/Evref-BL/pharo-image-fs-daemon/pkg/protocol"
 	nfs "github.com/willscott/go-nfs"
+	nfsfile "github.com/willscott/go-nfs/file"
 )
 
 const objectPath = "/tonel/Kernel/Object.class.st"
@@ -49,6 +50,32 @@ func truncateAsNFS(t *testing.T, fsys *nfsFileSystem, name string, size int64) {
 	if err := file.Truncate(size); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
+}
+
+// writeNFS is writeAsNFS for a goroutine, which must not fail the test.
+func writeNFS(fsys *nfsFileSystem, name string, data string, offset int64) error {
+	file, err := fsys.OpenFile(name, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := file.Write([]byte(data)); err != nil {
+		return err
+	}
+	_, err = fsys.Written(name, false)
+	return err
+}
+
+// readNFS is readAsNFS for a goroutine, which must not fail the test.
+func readNFS(fsys *nfsFileSystem, name string) (string, error) {
+	file, err := fsys.Open(name)
+	if err != nil {
+		return "", err
+	}
+	contents, err := io.ReadAll(file)
+	return string(contents), err
 }
 
 func readAsNFS(t *testing.T, fsys *nfsFileSystem, name string) string {
@@ -234,25 +261,88 @@ func TestNFSReadOnlyFilesRefuseWriting(t *testing.T) {
 	}
 }
 
-func TestNFSRemovingAnOpenClassKeepsItReadable(t *testing.T) {
-	client := newMemoryClient(map[string]string{objectPath: "object source"})
+func TestNFSRemovingAnOpenClassKeepsItUntilTheLastClose(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "object source", "/tonel/Kernel/Other.class.st": "other"})
 	fsys := newNFSFileSystem(client)
 	silly := "/tonel/Kernel/.nfs0000000012345678"
 
 	if err := fsys.Rename(objectPath, silly); err != nil {
 		t.Fatalf("silly rename: %v", err)
 	}
-	if client.has(objectPath) {
-		t.Fatalf("removing the file should remove the class")
+	if _, err := fsys.Stat(objectPath); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("the removed name should be gone, got %v", err)
+	}
+	if listed, _ := fsys.ReadDir("/tonel/Kernel"); containsInfoNamed(listed, "Object.class.st") {
+		t.Fatalf("the removed name should not be listed")
 	}
 	if contents := readAsNFS(t, fsys, silly); contents != "object source" {
 		t.Fatalf("the open file should stay readable, read %q", contents)
 	}
+	if !client.has(objectPath) {
+		t.Fatalf("the class should stay until the last close")
+	}
 	if err := fsys.Remove(silly); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
+	if client.has(objectPath) {
+		t.Fatalf("the last close should remove the class")
+	}
 	if _, err := fsys.Stat(silly); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("the renamed file should be gone, got %v", err)
+	}
+}
+
+func TestNFSASaveOverAnOpenClassCompilesOverIt(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "object source", "/tonel/Kernel/Other.class.st": "other"})
+	fsys := newNFSFileSystem(client)
+	silly := "/tonel/Kernel/.nfs0000000012345678"
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+
+	if err := fsys.Rename(objectPath, silly); err != nil {
+		t.Fatalf("silly rename: %v", err)
+	}
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_, _ = writeAsNFS(t, fsys, temp, "saved source", 0)
+	if err := fsys.Rename(temp, objectPath); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if err := fsys.Remove(silly); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if contents := client.contents(objectPath); !client.has(objectPath) || contents != "saved source" {
+		t.Fatalf("the save should compile over the class and keep it, image has %q", contents)
+	}
+	if deleted := client.deletes(); len(deleted) != 0 {
+		t.Fatalf("the save should compile over the class, not remove it first: removed %v", deleted)
+	}
+}
+
+func TestNFSARefusedSaveOverAnOpenClassKeepsIt(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "object source"})
+	fsys := newNFSFileSystem(client)
+	silly := "/tonel/Kernel/.nfs0000000012345678"
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+
+	if err := fsys.Rename(objectPath, silly); err != nil {
+		t.Fatalf("silly rename: %v", err)
+	}
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_, _ = writeAsNFS(t, fsys, temp, "syntax error", 0)
+	if err := fsys.Rename(temp, objectPath); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("a refused save should fail with EIO, got %v", err)
+	}
+	if contents := readAsNFS(t, fsys, objectPath); contents != "object source" {
+		t.Fatalf("the class should show again under its name, read %q", contents)
+	}
+	if err := fsys.Remove(silly); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if !client.has(objectPath) {
+		t.Fatalf("the last close should not remove a class shown again")
 	}
 }
 
@@ -343,8 +433,11 @@ func TestNFSHandlesNameOnePathForTheDaemonsLife(t *testing.T) {
 		t.Fatalf("one path should keep one handle")
 	}
 	_, components, err := handler.FromHandle(handle)
-	if err != nil || strings.Join(components, "/") != "tonel/Kernel" {
-		t.Fatalf("handle should name tonel/Kernel, got %v, %v", components, err)
+	if err != nil {
+		t.Fatalf("from handle: %v", err)
+	}
+	if resolved, _ := handler.fsys.ids.resolve(path.Join(components...)); resolved != "/tonel/Kernel" {
+		t.Fatalf("handle should name /tonel/Kernel, got %q", resolved)
 	}
 	if _, _, err := handler.FromHandle([]byte{0, 0, 0, 0, 0, 0, 0, 99}); err == nil {
 		t.Fatalf("an unknown handle should be stale")
@@ -387,6 +480,7 @@ type memoryClient struct {
 	files    map[string]string
 	modified map[string]int64
 	written  []string
+	deleted  []string
 }
 
 func newMemoryClient(files map[string]string) *memoryClient {
@@ -516,7 +610,14 @@ func (c *memoryClient) Delete(_ context.Context, filePath string) error {
 		return &protocol.Error{StatusCode: http.StatusNotFound}
 	}
 	delete(c.files, filePath)
+	c.deleted = append(c.deleted, filePath)
 	return nil
+}
+
+func (c *memoryClient) deletes() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.deleted...)
 }
 
 func (c *memoryClient) Rename(_ context.Context, sourcePath string, targetPath string) error {
@@ -537,4 +638,384 @@ func (c *memoryClient) Mkdir(context.Context, string) error {
 
 func (c *memoryClient) Rmdir(context.Context, string) error {
 	return nil
+}
+
+func TestNFSConcurrentWritesToAnEditorFileLoseNothing(t *testing.T) {
+	fsys := newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "old"}))
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	const pages = 32
+	var group sync.WaitGroup
+	for page := range pages {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			file, err := fsys.OpenFile(temp, os.O_RDWR, 0)
+			if err != nil {
+				t.Errorf("open: %v", err)
+				return
+			}
+			_, _ = file.Seek(int64(page*pageSize), io.SeekStart)
+			if _, err := file.Write([]byte(strings.Repeat(string(rune('a'+page%26)), pageSize))); err != nil {
+				t.Errorf("write: %v", err)
+			}
+		}()
+	}
+	group.Wait()
+
+	contents := readAsNFS(t, fsys, temp)
+	for page := range pages {
+		if contents[page*pageSize] != byte('a'+page%26) {
+			t.Fatalf("page %d was lost to another write", page)
+		}
+	}
+}
+
+func TestNFSHeldFileCompilesOnceWhileItsCompileRuns(t *testing.T) {
+	client := newGatedClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	truncateAsNFS(t, fsys, objectPath, 0)
+	started, open := client.holdNext("write")
+	defer open()
+
+	first := make(chan error, 1)
+	go func() { first <- writeNFS(fsys, objectPath, "new source", 0) }()
+	waitHeld(t, started)
+	second := make(chan error, 1)
+	go func() {
+		_, err := fsys.Written(objectPath, false)
+		second <- err
+	}()
+	select {
+	case <-second:
+		t.Fatalf("a second commit should wait for the compile running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	open()
+	if err := within(t, first, "the first commit"); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if err := within(t, second, "the second commit"); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if written := client.writes(); len(written) != 1 {
+		t.Fatalf("the whole file should compile once, got %d compiles", len(written))
+	}
+}
+
+func TestNFSAHandleOvertakenByARenameNamesItsFile(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	handler := newNFSHandler(fsys)
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_, _ = writeAsNFS(t, fsys, temp, "new source", 0)
+	nameFor := func(projectionPath string) string {
+		_, components, err := handler.FromHandle(handler.ToHandle(fsys, strings.Split(strings.TrimPrefix(projectionPath, "/"), "/")))
+		if err != nil {
+			t.Fatalf("handle of %s: %v", projectionPath, err)
+		}
+		return path.Join(components...)
+	}
+	className, tempName := nameFor(objectPath), nameFor(temp)
+	tempID := fsys.ids.idFor(temp)
+
+	if err := fsys.Rename(temp, objectPath); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+
+	if _, err := fsys.Lstat(className); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("a name from the replaced file's handle should be stale, got %v", err)
+	}
+	if _, err := fsys.OpenFile(className, os.O_RDWR, 0); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("writing through the replaced file's handle should be stale, got %v", err)
+	}
+	if _, err := fsys.Written(className, false); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("committing through the replaced file's handle should be stale, got %v", err)
+	}
+	info, err := fsys.Lstat(tempName)
+	if err != nil {
+		t.Fatalf("lstat through the renamed file's handle: %v", err)
+	}
+	if info.Name() != "Object.class.st" || info.Sys().(*nfsfile.FileInfo).Fileid != tempID {
+		t.Fatalf("the renamed file's handle should name it where it is, got %s, id %d", info.Name(), info.Sys().(*nfsfile.FileInfo).Fileid)
+	}
+	if written := client.writes(); len(written) != 1 {
+		t.Fatalf("only the rename should compile, got %d compiles", len(written))
+	}
+}
+
+func TestNFSACallOnAFileWaitsWhileTheImageRenamesIt(t *testing.T) {
+	renamed := "/tonel/Kernel/Renamed.class.st"
+	client := newGatedClient(map[string]string{objectPath: "source"})
+	fsys := newNFSFileSystem(client)
+	handler := newNFSHandler(fsys)
+	_, components, _ := handler.FromHandle(handler.ToHandle(fsys, []string{"tonel", "Kernel", "Object.class.st"}))
+	objectID := fsys.ids.idFor(objectPath)
+	started, open := client.holdNext("rename")
+	defer open()
+
+	renaming := make(chan error, 1)
+	go func() { renaming <- fsys.Rename(objectPath, renamed) }()
+	waitHeld(t, started)
+	looked := make(chan os.FileInfo, 1)
+	go func() {
+		info, _ := fsys.Lstat(path.Join(components...))
+		looked <- info
+	}()
+	select {
+	case <-looked:
+		t.Fatalf("a call on a file should wait while the image renames it")
+	case <-time.After(100 * time.Millisecond):
+	}
+	open()
+	if err := within(t, renaming, "the rename"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	info := within(t, looked, "the call on the file")
+	if info == nil || info.Name() != "Renamed.class.st" || info.Sys().(*nfsfile.FileInfo).Fileid != objectID {
+		t.Fatalf("the call should answer the file where the rename put it, got %v", info)
+	}
+}
+
+func TestNFSAReadRacingASaveIsNotKept(t *testing.T) {
+	client := newGatedClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	started, open := client.holdNext("read")
+	defer open()
+
+	type result struct {
+		contents string
+		err      error
+	}
+	read := make(chan result, 1)
+	go func() {
+		contents, err := readNFS(fsys, objectPath)
+		read <- result{contents, err}
+	}()
+	waitHeld(t, started)
+	truncateAsNFS(t, fsys, objectPath, 0)
+	if _, err := writeAsNFS(t, fsys, objectPath, "new source", 0); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	open()
+	if got := within(t, read, "the read"); got.err != nil || got.contents != "new source" {
+		t.Fatalf("a read the save overtook should read again, got %q, %v", got.contents, got.err)
+	}
+	if contents := readAsNFS(t, fsys, objectPath); contents != "new source" {
+		t.Fatalf("the read before the save should not be kept, read %q", contents)
+	}
+}
+
+func TestNFSAReadOvertakenByARenameSaveIsNotKept(t *testing.T) {
+	client := newGatedClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// As long as the old source, so that only the save, not the size, tells
+	// the two apart.
+	_, _ = writeAsNFS(t, fsys, temp, "new source", 0)
+
+	statted, openStat := client.holdNext("stat")
+	defer openStat()
+	type result struct {
+		contents string
+		err      error
+	}
+	read := make(chan result, 1)
+	go func() {
+		contents, err := readNFS(fsys, objectPath)
+		read <- result{contents, err}
+	}()
+	waitHeld(t, statted)
+
+	compiling, openCompile := client.holdNext("write")
+	defer openCompile()
+	renaming := make(chan error, 1)
+	go func() { renaming <- fsys.Rename(temp, objectPath) }()
+	waitHeld(t, compiling)
+
+	reading, openRead := client.holdNext("read")
+	defer openRead()
+	openStat()
+	waitHeld(t, reading)
+	openCompile()
+	if err := within(t, renaming, "the rename"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	openRead()
+	if got := within(t, read, "the read"); got.err != nil || got.contents != "new source" {
+		t.Fatalf("a read the rename save overtook should read again, got %q, %v", got.contents, got.err)
+	}
+	if contents := readAsNFS(t, fsys, objectPath); contents != "new source" {
+		t.Fatalf("what the image rendered during the save should not be kept, read %q", contents)
+	}
+}
+
+func TestNFSAnEditorFileReadsAsWritten(t *testing.T) {
+	fsys := newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "source"}))
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_, _ = writeAsNFS(t, fsys, temp, "first", 0)
+	if contents := readAsNFS(t, fsys, temp); contents != "first" {
+		t.Fatalf("read %q", contents)
+	}
+	before := modifiedAt(t, fsys, temp)
+	_, _ = writeAsNFS(t, fsys, temp, "fresh", 0)
+	if contents := readAsNFS(t, fsys, temp); contents != "fresh" {
+		t.Fatalf("a read after a write should answer it, read %q", contents)
+	}
+	if !modifiedAt(t, fsys, temp).After(before) {
+		t.Fatalf("a write of the same size should still move the file's time")
+	}
+}
+
+func TestNFSEachRefusalShowsInLatestError(t *testing.T) {
+	fsys := newNFSFileSystem(&echoRefusingClient{memoryClient: newMemoryClient(map[string]string{objectPath: "source"})})
+	latest := "/errors/latest.txt"
+
+	truncateAsNFS(t, fsys, objectPath, 0)
+	_, _ = writeAsNFS(t, fsys, objectPath, "refusal A", 0)
+	if first := readAsNFS(t, fsys, latest); !strings.Contains(first, "refusal A") {
+		t.Fatalf("latest.txt should answer the first refusal, read %q", first)
+	}
+	before := modifiedAt(t, fsys, latest)
+	truncateAsNFS(t, fsys, objectPath, 0)
+	_, _ = writeAsNFS(t, fsys, objectPath, "refusal B", 0)
+	if second := readAsNFS(t, fsys, latest); !strings.Contains(second, "refusal B") {
+		t.Fatalf("latest.txt should answer the second refusal, read %q", second)
+	}
+	if !modifiedAt(t, fsys, latest).After(before) {
+		t.Fatalf("a refusal as long as the last should still move latest.txt's time")
+	}
+}
+
+// echoRefusingClient refuses every compile, saying what it was given.
+type echoRefusingClient struct {
+	*memoryClient
+}
+
+func (c *echoRefusingClient) Write(_ context.Context, _ string, contents []byte) (protocol.WriteResult, error) {
+	return protocol.WriteResult{}, &protocol.Error{StatusCode: http.StatusBadRequest, Message: string(contents)}
+}
+
+func TestNFSSillyRenamesOwnOnlyTheirOwnRemoval(t *testing.T) {
+	for _, hideAgain := range []string{"/tonel/Kernel/.nfs0000000000000002", "/tonel/Kernel/Object.class.st~"} {
+		client := newMemoryClient(map[string]string{objectPath: "object source", "/tonel/Kernel/Other.class.st": "other"})
+		fsys := newNFSFileSystem(client)
+		first := "/tonel/Kernel/.nfs0000000000000001"
+		temp := "/tonel/Kernel/.Object.class.st.swp"
+
+		if err := fsys.Rename(objectPath, first); err != nil {
+			t.Fatalf("silly rename: %v", err)
+		}
+		if _, err := fsys.Create(temp); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		_, _ = writeAsNFS(t, fsys, temp, "saved source", 0)
+		if err := fsys.Rename(temp, objectPath); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if err := fsys.Rename(objectPath, hideAgain); err != nil {
+			t.Fatalf("rename to %s: %v", hideAgain, err)
+		}
+		if err := fsys.Remove(first); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if !client.has(objectPath) {
+			t.Fatalf("closing the version a save replaced should not remove the class (then renamed to %s)", path.Base(hideAgain))
+		}
+	}
+}
+
+func TestNFSARefusedRemovalAtTheLastCloseShowsTheClassAgain(t *testing.T) {
+	client := &refusingDeleteClient{memoryClient: newMemoryClient(map[string]string{objectPath: "object source"})}
+	fsys := newNFSFileSystem(client)
+	silly := "/tonel/Kernel/.nfs0000000012345678"
+
+	if err := fsys.Rename(objectPath, silly); err != nil {
+		t.Fatalf("silly rename: %v", err)
+	}
+	if err := fsys.Remove(silly); err != nil {
+		t.Fatalf("the last close's remove should answer what it did to the .nfs file: %v", err)
+	}
+	if _, err := fsys.Stat(silly); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("the .nfs file should be gone, got %v", err)
+	}
+	if contents := readAsNFS(t, fsys, objectPath); contents != "object source" {
+		t.Fatalf("the class the image kept should show again, read %q", contents)
+	}
+	if latest := readAsNFS(t, fsys, "/errors/latest.txt"); !strings.Contains(latest, "Object.class.st") {
+		t.Fatalf("the refusal should be in latest.txt, read %q", latest)
+	}
+}
+
+func TestNFSARefusedRenameOntoAnOpenClassShowsItAgain(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "object source", "/tonel/Kernel/Other.class.st": "other"})
+	fsys := newNFSFileSystem(client)
+	silly := "/tonel/Kernel/.nfs0000000012345678"
+	other := "/tonel/Kernel/Other.class.st"
+
+	truncateAsNFS(t, fsys, other, 0)
+	_, _ = writeAsNFS(t, fsys, other, strings.Repeat("syntax error ", pageSize/13+1)[:pageSize], 0)
+	if err := fsys.Rename(objectPath, silly); err != nil {
+		t.Fatalf("silly rename: %v", err)
+	}
+	if err := fsys.Rename(other, objectPath); err == nil {
+		t.Fatalf("renaming a file whose held writes are refused should fail")
+	}
+	if contents := readAsNFS(t, fsys, objectPath); contents != "object source" {
+		t.Fatalf("the class should show again, read %q", contents)
+	}
+	if err := fsys.Remove(silly); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if !client.has(objectPath) {
+		t.Fatalf("the last close should not remove a class shown again")
+	}
+}
+
+// refusingDeleteClient refuses to remove any class, as the image does in a
+// package no repository owns.
+type refusingDeleteClient struct {
+	*memoryClient
+}
+
+func (c *refusingDeleteClient) Delete(context.Context, string) error {
+	return &protocol.Error{StatusCode: http.StatusBadRequest, Message: "Package is not owned by a repository"}
+}
+
+func TestNFSAWriteFollowsItsFileToAnEditorBackup(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	backup := "/tonel/Kernel/Object.class.st~"
+
+	file, err := fsys.OpenFile(objectPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := fsys.Rename(objectPath, backup); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if _, err := file.Write([]byte("NEW")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if contents, ok := fsys.overlay.Read(backup); !ok || string(contents) != "NEW source" {
+		t.Fatalf("the write should reach the backup in the overlay, has %q", contents)
+	}
+	fsys.mu.Lock()
+	_, held := fsys.pending[backup]
+	fsys.mu.Unlock()
+	if held {
+		t.Fatalf("an editor's backup should not hold writes for the image")
+	}
 }

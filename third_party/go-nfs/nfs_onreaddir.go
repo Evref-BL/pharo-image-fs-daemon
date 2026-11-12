@@ -1,5 +1,8 @@
 package nfs
 
+// Changed for pharo-image-fs: an error from the file system keeps its errno's
+// meaning (see pifs.go), STALE included.
+
 import (
 	"bytes"
 	"context"
@@ -158,7 +161,7 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 		if os.IsPermission(err) {
 			return nil, 0, &NFSStatusError{NFSStatusAccess, err}
 		}
-		return nil, 0, &NFSStatusError{NFSStatusNotDir, err}
+		return nil, 0, &NFSStatusError{statusFromError(err, NFSStatusNotDir), err}
 	}
 
 	sort.Slice(contents, func(i, j int) bool {

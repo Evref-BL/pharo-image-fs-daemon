@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -39,14 +40,40 @@ const (
 // file's writes are held until they make a whole file, and the write that
 // completes it compiles it: a refused compile fails that write, and the
 // writer's close(2). Editors' and macOS's own files live in the overlay.
+//
+// go-nfs serves several calls at once. Changes run one at a time, under
+// changing, which each holds through its call to the image: the image
+// compiles one file at a time, and no change interleaves with another's check
+// and act on held writes or editor files. While a change runs, calls on the
+// paths it changes, and on everything under them, wait for it, and a call
+// that ran while a change of its path began runs again (see observe): no call
+// sees a file halfway through a compile or a rename, and calls on other files
+// go on.
+//
+// The names go-nfs passes carry the id of the file their handle named (see
+// componentsFor), so each call acts on that file wherever it is by then.
 type nfsFileSystem struct {
 	*projection
 
 	uid     uint32
 	gid     uint32
 	started time.Time
+	ids     *identities
 
-	mu       sync.Mutex
+	changing sync.Mutex
+	// silly maps each ".nfs…" file the client renamed an open class file to,
+	// to that file's path; the class goes when the ".nfs…" file does. Guarded
+	// by changing.
+	silly map[string]string
+
+	mu sync.Mutex
+	// busy is what the running change changes, and settled is broadcast when
+	// it ends. marks holds, for each path a change changed, the number of the
+	// last change that did, and begun the number of the last change begun.
+	busy     []string
+	settled  *sync.Cond
+	marks    map[string]uint64
+	begun    uint64
 	pending  map[string]*heldFile
 	changed  map[string]time.Time
 	sizes    map[string]uint64
@@ -64,20 +91,27 @@ type listing struct {
 type cachedRead struct {
 	contents []byte
 	read     time.Time
+	size     uint64
+	modified int64
 }
 
 func newNFSFileSystem(client protocol.Client) *nfsFileSystem {
-	return &nfsFileSystem{
+	fsys := &nfsFileSystem{
 		projection: newProjection(client),
 		uid:        uint32(os.Getuid()),
 		gid:        uint32(os.Getgid()),
 		started:    time.Now(),
+		ids:        newIdentities(),
+		silly:      map[string]string{},
+		marks:      map[string]uint64{},
 		pending:    map[string]*heldFile{},
 		changed:    map[string]time.Time{},
 		sizes:      map[string]uint64{},
 		listings:   map[string]listing{},
 		reads:      map[string]cachedRead{},
 	}
+	fsys.settled = sync.NewCond(&fsys.mu)
+	return fsys
 }
 
 // projectionPathFor answers the projection path of a go-nfs file name, which
@@ -90,18 +124,136 @@ func pathError(op string, projectionPath string, errno syscall.Errno) error {
 	return &os.PathError{Op: op, Path: projectionPath, Err: errno}
 }
 
+// nameError is the error of op on a name that resolve refused.
+func nameError(op string, name string, errno syscall.Errno) error {
+	return pathError(op, strings.ReplaceAll(name, idMark, "#"), errno)
+}
+
+// maxFileSize bounds what a write or truncation may make a file: no class
+// file comes near it, and running out of memory is not a panic that a
+// recovery could answer.
+const maxFileSize = 64 << 20
+
+// recovered answers a call whose handler panicked, which the daemon
+// survives: the call fails, and the panic is in the log.
+func (fsys *nfsFileSystem) recovered(value any) nfs.ResponseCode {
+	fsys.logf("panic serving NFS: %v\n%s", value, debug.Stack())
+	return nfs.ResponseCodeSystemErr
+}
+
+// beginChange starts a change: it waits for the one running, and answers the
+// paths names stand for now. endChange ends it.
+func (fsys *nfsFileSystem) beginChange(op string, names ...string) ([]string, error) {
+	fsys.changing.Lock()
+	paths := make([]string, len(names))
+	for index, name := range names {
+		projectionPath, errno := fsys.ids.resolve(name)
+		if errno != 0 {
+			fsys.changing.Unlock()
+			return nil, nameError(op, name, errno)
+		}
+		paths[index] = projectionPath
+	}
+	return paths, nil
+}
+
+// keepOff makes calls on paths, and on everything under them, wait until the
+// running change ends, and those that began before it run again.
+func (fsys *nfsFileSystem) keepOff(paths ...string) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+
+	fsys.begun++
+	fsys.busy = append(fsys.busy, paths...)
+	for _, projectionPath := range paths {
+		fsys.marks[projectionPath] = fsys.begun
+	}
+}
+
+func (fsys *nfsFileSystem) endChange() {
+	fsys.mu.Lock()
+	fsys.busy = nil
+	fsys.mu.Unlock()
+	fsys.settled.Broadcast()
+	fsys.changing.Unlock()
+}
+
+// isBusyLocked answers whether projectionPath is, or is under, a path the
+// running change changes.
+func (fsys *nfsFileSystem) isBusyLocked(projectionPath string) bool {
+	for _, busy := range fsys.busy {
+		if _, ok := pathUnder(projectionPath, busy); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// markLocked answers the number of the last change of projectionPath or of a
+// directory above it.
+func (fsys *nfsFileSystem) markLocked(projectionPath string) uint64 {
+	var latest uint64
+	for current := projectionPath; ; current = path.Dir(current) {
+		latest = max(latest, fsys.marks[current])
+		if current == "/" {
+			return latest
+		}
+	}
+}
+
+// observe runs read on what name stands for, once no change changes it, and
+// again if a change of it began meanwhile: so read answers what held between
+// two changes, never what one left halfway.
+func (fsys *nfsFileSystem) observe(op string, name string, read func(projectionPath string) error) error {
+	for {
+		fsys.mu.Lock()
+		begun := fsys.begun
+		fsys.mu.Unlock()
+		projectionPath, errno := fsys.ids.resolve(name)
+		if errno != 0 {
+			return nameError(op, name, errno)
+		}
+
+		fsys.mu.Lock()
+		if fsys.markLocked(projectionPath) > begun || fsys.isBusyLocked(projectionPath) {
+			for fsys.isBusyLocked(projectionPath) {
+				fsys.settled.Wait()
+			}
+			fsys.mu.Unlock()
+			continue
+		}
+		fsys.mu.Unlock()
+
+		err := read(projectionPath)
+		fsys.mu.Lock()
+		unchanged := fsys.markLocked(projectionPath) <= begun
+		fsys.mu.Unlock()
+		if unchanged {
+			return err
+		}
+	}
+}
+
 // billy.Basic
 
 func (fsys *nfsFileSystem) Create(name string) (billy.File, error) {
-	projectionPath := projectionPathFor(name)
+	paths, err := fsys.beginChange("create", name)
+	if err != nil {
+		return nil, err
+	}
+	defer fsys.endChange()
+	projectionPath := paths[0]
 	if isAppleDoublePath(projectionPath) {
 		return nil, pathError("create", projectionPath, syscall.ENOTSUP)
 	}
+	fsys.keepOff(projectionPath)
+
 	if isIgnoredMetadataPath(projectionPath) {
 		if !isWritableProjectionPath(projectionPath) {
 			return nil, pathError("create", projectionPath, syscall.EROFS)
 		}
 		fsys.overlay.Create(projectionPath, nil)
+		fsys.ids.removed(projectionPath)
 		fsys.namespaceChanged(projectionPath)
 		return fsys.newFile(name, projectionPath, overlayFile), nil
 	}
@@ -109,6 +261,7 @@ func (fsys *nfsFileSystem) Create(name string) (billy.File, error) {
 	if _, errno := fsys.createFile(projectionPath); errno != 0 {
 		return nil, pathError("create", projectionPath, errno)
 	}
+	fsys.forgetSilly(projectionPath)
 	kind := overlayFile
 	if isProjectedTonelFilePath(projectionPath) {
 		fsys.overlay.Delete(projectionPath)
@@ -117,6 +270,7 @@ func (fsys *nfsFileSystem) Create(name string) (billy.File, error) {
 		fsys.mu.Unlock()
 		kind = pendingFile
 	}
+	fsys.ids.removed(projectionPath)
 	fsys.namespaceChanged(projectionPath)
 	return fsys.newFile(name, projectionPath, kind), nil
 }
@@ -126,35 +280,44 @@ func (fsys *nfsFileSystem) Open(name string) (billy.File, error) {
 }
 
 func (fsys *nfsFileSystem) OpenFile(name string, flag int, _ os.FileMode) (billy.File, error) {
-	projectionPath := projectionPathFor(name)
-	entry, errno := fsys.entryFor(projectionPath)
-	if errno != 0 {
-		return nil, pathError("open", projectionPath, errno)
-	}
-	if entry.Kind == protocol.Directory {
-		return nil, pathError("open", projectionPath, syscall.EISDIR)
-	}
-
-	if flag&(os.O_WRONLY|os.O_RDWR) == 0 {
-		contents, err := fsys.contentsToRead(projectionPath)
-		if err != nil {
-			return nil, pathError("open", projectionPath, errnoFor(err))
+	var file *nfsFile
+	err := fsys.observe("open", name, func(projectionPath string) error {
+		file = nil
+		entry, errno := fsys.entryFor(projectionPath)
+		if errno != 0 {
+			return pathError("open", projectionPath, errno)
 		}
-		file := fsys.newFile(name, projectionPath, snapshotFile)
-		file.contents = contents
-		return file, nil
-	}
+		if entry.Kind == protocol.Directory {
+			return pathError("open", projectionPath, syscall.EISDIR)
+		}
 
-	if !entry.Writable {
-		return nil, pathError("open", projectionPath, syscall.EROFS)
+		if flag&(os.O_WRONLY|os.O_RDWR) == 0 {
+			contents, err := fsys.contentsToRead(projectionPath, entry)
+			if err != nil {
+				return pathError("open", projectionPath, errnoFor(err))
+			}
+			file = fsys.newFile(name, projectionPath, snapshotFile)
+			file.contents = contents
+			return nil
+		}
+
+		if !entry.Writable {
+			return pathError("open", projectionPath, syscall.EROFS)
+		}
+		if _, ok := fsys.overlay.Stat(projectionPath); ok {
+			file = fsys.newFile(name, projectionPath, overlayFile)
+			return nil
+		}
+		if isProjectedTonelFilePath(projectionPath) {
+			file = fsys.newFile(name, projectionPath, pendingFile)
+			return nil
+		}
+		return pathError("open", projectionPath, syscall.EROFS)
+	})
+	if err != nil {
+		return nil, err
 	}
-	if _, ok := fsys.overlay.Stat(projectionPath); ok {
-		return fsys.newFile(name, projectionPath, overlayFile), nil
-	}
-	if isProjectedTonelFilePath(projectionPath) {
-		return fsys.newFile(name, projectionPath, pendingFile), nil
-	}
-	return nil, pathError("open", projectionPath, syscall.EROFS)
+	return file, nil
 }
 
 func (fsys *nfsFileSystem) Stat(name string) (os.FileInfo, error) {
@@ -162,13 +325,19 @@ func (fsys *nfsFileSystem) Stat(name string) (os.FileInfo, error) {
 }
 
 func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
-	oldPath := projectionPathFor(oldName)
-	newPath := projectionPathFor(newName)
+	paths, err := fsys.beginChange("rename", oldName, newName)
+	if err != nil {
+		return err
+	}
+	defer fsys.endChange()
+	oldPath, newPath := paths[0], paths[1]
 	if isAppleDoublePath(newPath) {
 		return pathError("rename", newPath, syscall.ENOTSUP)
 	}
+	fsys.keepOff(oldPath, newPath)
 
 	if err := fsys.commitHeld(oldPath); err != nil {
+		fsys.showRemovedClass(newPath)
 		return err
 	}
 	fsys.mu.Lock()
@@ -184,32 +353,91 @@ func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 	fsys.namespaceChanged(oldPath)
 	fsys.namespaceChanged(newPath)
 	if errno != 0 {
+		fsys.showRemovedClass(newPath)
 		return pathError("rename", newPath, errno)
+	}
+	fsys.ids.renamed(oldPath, newPath)
+	if original, ok := fsys.silly[oldPath]; ok {
+		delete(fsys.silly, oldPath)
+		fsys.silly[newPath] = original
+	} else if !isSillyRenameName(path.Base(newPath)) {
+		fsys.forgetSilly(newPath)
 	}
 	return nil
 }
 
 // sillyRename keeps a removed file readable for those who still have it
-// open, as the NFS client asks by renaming it to ".nfs…": the class goes, and
-// its last contents stay under the new name until the client removes it.
+// open, as the NFS client asks by renaming it to ".nfs…": its name goes, and
+// its last contents stay under the new one. The class stays in the image
+// until the client removes the ".nfs…" file, at the last close, so that a
+// rename or create onto the name meanwhile compiles over it rather than
+// replacing it.
 func (fsys *nfsFileSystem) sillyRename(oldPath string, newPath string) syscall.Errno {
 	contents, err := fsys.contentsForPath(oldPath)
 	if err != nil {
 		return errnoFor(err)
 	}
-	if errno := fsys.unlink(oldPath); errno != 0 {
-		return errno
-	}
 	fsys.overlay.Create(newPath, contents)
+	fsys.overlay.Hide(oldPath)
+	fsys.silly[newPath] = oldPath
 	return 0
 }
 
+// showRemovedClass shows the class at projectionPath again, when its file was
+// removed while open and what was to take the name failed: the image still
+// has it, as a refused rename save leaves it.
+func (fsys *nfsFileSystem) showRemovedClass(projectionPath string) {
+	for _, original := range fsys.silly {
+		if original == projectionPath && fsys.overlay.IsHidden(projectionPath) {
+			fsys.overlay.Delete(projectionPath)
+			fsys.namespaceChanged(projectionPath)
+			fsys.forgetSilly(projectionPath)
+			return
+		}
+	}
+}
+
+// forgetSilly drops the ".nfs…" files that stand for the class at
+// projectionPath, once something else took the name: the class is no longer
+// theirs to remove at their last close.
+func (fsys *nfsFileSystem) forgetSilly(projectionPath string) {
+	for sillyPath, original := range fsys.silly {
+		if original == projectionPath {
+			delete(fsys.silly, sillyPath)
+		}
+	}
+}
+
 func (fsys *nfsFileSystem) Remove(name string) error {
-	projectionPath := projectionPathFor(name)
+	paths, err := fsys.beginChange("remove", name)
+	if err != nil {
+		return err
+	}
+	defer fsys.endChange()
+	projectionPath := paths[0]
+	original, removesClass := fsys.silly[projectionPath]
+	removesClass = removesClass && fsys.overlay.IsHidden(original)
+	if removesClass {
+		fsys.keepOff(projectionPath, original)
+	} else {
+		fsys.keepOff(projectionPath)
+	}
+
 	entry, errno := fsys.entryFor(projectionPath)
 	if errno != 0 {
 		return pathError("remove", projectionPath, errno)
 	}
+	if removesClass {
+		// The client does not look at what its last close's REMOVE answers: a
+		// refusal is recorded in /errors, and the class shows again.
+		if err := fsys.client.Delete(context.Background(), original); err != nil && !protocol.NotFound(err) {
+			fsys.logf("delete %s failed: %v", original, err)
+			fsys.errors.RecordWriteError(original, err)
+		}
+		fsys.overlay.Delete(original)
+		fsys.namespaceChanged(original)
+	}
+	delete(fsys.silly, projectionPath)
 
 	fsys.mu.Lock()
 	delete(fsys.pending, projectionPath)
@@ -223,6 +451,7 @@ func (fsys *nfsFileSystem) Remove(name string) error {
 	if errno != 0 {
 		return pathError("remove", projectionPath, errno)
 	}
+	fsys.ids.removed(projectionPath)
 	return nil
 }
 
@@ -233,73 +462,98 @@ func (fsys *nfsFileSystem) Join(elem ...string) string {
 // billy.TempFile
 
 func (fsys *nfsFileSystem) TempFile(dir string, _ string) (billy.File, error) {
-	return nil, pathError("tempfile", projectionPathFor(dir), syscall.ENOTSUP)
+	return nil, nameError("tempfile", dir, syscall.ENOTSUP)
 }
 
 // billy.Dir
 
 func (fsys *nfsFileSystem) ReadDir(name string) ([]os.FileInfo, error) {
-	projectionPath := projectionPathFor(name)
-	entries, errno := fsys.entriesIn(projectionPath)
-	if errno != 0 {
-		return nil, pathError("readdir", projectionPath, errno)
-	}
-
-	fsys.mu.Lock()
-	for pendingPath := range fsys.pending {
-		if path.Dir(pendingPath) == projectionPath && !containsEntryNamed(entries, path.Base(pendingPath)) {
-			entries = append(entries, protocol.Entry{Name: path.Base(pendingPath), Kind: protocol.File, Writable: true})
+	var infos []os.FileInfo
+	err := fsys.observe("readdir", name, func(projectionPath string) error {
+		entries, errno := fsys.entriesIn(projectionPath)
+		if errno != 0 {
+			return pathError("readdir", projectionPath, errno)
 		}
-	}
-	fsys.mu.Unlock()
 
-	infos := make([]os.FileInfo, 0, len(entries))
-	for _, entry := range entries {
-		// A listing names its entries; their times and sizes come from the
-		// lookups that follow, which is all READDIR asks for.
-		infos = append(infos, fsys.infoFor(joinProjectionPath(projectionPath, entry.Name), entry, fsys.started))
+		fsys.mu.Lock()
+		for pendingPath := range fsys.pending {
+			if path.Dir(pendingPath) == projectionPath && !containsEntryNamed(entries, path.Base(pendingPath)) {
+				entries = append(entries, protocol.Entry{Name: path.Base(pendingPath), Kind: protocol.File, Writable: true})
+			}
+		}
+		fsys.mu.Unlock()
+
+		infos = make([]os.FileInfo, 0, len(entries))
+		for _, entry := range entries {
+			// A listing names its entries; their times and sizes come from the
+			// lookups that follow, which is all READDIR asks for.
+			infos = append(infos, fsys.infoFor(joinProjectionPath(projectionPath, entry.Name), entry, fsys.started))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return infos, nil
 }
 
 func (fsys *nfsFileSystem) MkdirAll(name string, _ os.FileMode) error {
-	projectionPath := projectionPathFor(name)
+	paths, err := fsys.beginChange("mkdir", name)
+	if err != nil {
+		return err
+	}
+	defer fsys.endChange()
+	projectionPath := paths[0]
+	fsys.keepOff(projectionPath)
+
 	errno := fsys.mkdir(projectionPath)
 	fsys.namespaceChanged(projectionPath)
 	if errno != 0 {
 		return pathError("mkdir", projectionPath, errno)
 	}
+	fsys.ids.removed(projectionPath)
 	return nil
 }
 
 // billy.Symlink
 
 func (fsys *nfsFileSystem) Lstat(name string) (os.FileInfo, error) {
-	projectionPath := projectionPathFor(name)
-	entry, errno := fsys.entryFor(projectionPath)
-	if errno != 0 {
-		return nil, pathError("lstat", projectionPath, errno)
+	var info os.FileInfo
+	err := fsys.observe("lstat", name, func(projectionPath string) error {
+		entry, errno := fsys.entryFor(projectionPath)
+		if errno != 0 {
+			return pathError("lstat", projectionPath, errno)
+		}
+		info = fsys.infoFor(projectionPath, entry, fsys.modificationTime(projectionPath, entry))
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return fsys.infoFor(projectionPath, entry, fsys.modificationTime(projectionPath, entry)), nil
+	return info, nil
 }
 
 func (fsys *nfsFileSystem) Symlink(_ string, link string) error {
-	return pathError("symlink", projectionPathFor(link), syscall.EROFS)
+	return nameError("symlink", link, syscall.EROFS)
 }
 
 func (fsys *nfsFileSystem) Readlink(name string) (string, error) {
-	projectionPath := projectionPathFor(name)
-	target, errno := fsys.readlink(projectionPath)
-	if errno != 0 {
-		return "", pathError("readlink", projectionPath, errno)
-	}
-	return target, nil
+	var target string
+	err := fsys.observe("readlink", name, func(projectionPath string) error {
+		var errno syscall.Errno
+		target, errno = fsys.readlink(projectionPath)
+		if errno != 0 {
+			return pathError("readlink", projectionPath, errno)
+		}
+		return nil
+	})
+	return target, err
 }
 
 // billy.Chroot
 
 func (fsys *nfsFileSystem) Chroot(name string) (billy.Filesystem, error) {
-	return nil, pathError("chroot", projectionPathFor(name), syscall.ENOTSUP)
+	return nil, nameError("chroot", name, syscall.ENOTSUP)
 }
 
 func (fsys *nfsFileSystem) Root() string {
@@ -324,7 +578,13 @@ func (fsys *nfsFileSystem) Chtimes(string, time.Time, time.Time) error { return 
 // page are a whole file, and one whose size is a multiple of the page size
 // waits for the COMMIT.
 func (fsys *nfsFileSystem) Written(name string, _ bool) (bool, error) {
-	projectionPath := projectionPathFor(name)
+	paths, err := fsys.beginChange("write", name)
+	if err != nil {
+		return false, err
+	}
+	defer fsys.endChange()
+	projectionPath := paths[0]
+
 	fsys.mu.Lock()
 	held, ok := fsys.pending[projectionPath]
 	whole := ok && held.isWhole()
@@ -335,6 +595,7 @@ func (fsys *nfsFileSystem) Written(name string, _ bool) (bool, error) {
 	if !whole {
 		return false, nil
 	}
+	fsys.keepOff(projectionPath)
 	if err := fsys.commitHeld(projectionPath); err != nil {
 		return false, err
 	}
@@ -345,23 +606,43 @@ func (fsys *nfsFileSystem) Written(name string, _ bool) (bool, error) {
 // nfs.Committer. The client would not tell the writer of a refusal: it is
 // recorded in /errors, and the image's version stands.
 func (fsys *nfsFileSystem) Commit(name string) error {
-	_ = fsys.commitHeld(projectionPathFor(name))
+	paths, err := fsys.beginChange("commit", name)
+	if err != nil {
+		return err
+	}
+	defer fsys.endChange()
+	projectionPath := paths[0]
+
+	fsys.mu.Lock()
+	_, ok := fsys.pending[projectionPath]
+	fsys.mu.Unlock()
+	if ok {
+		fsys.keepOff(projectionPath)
+		_ = fsys.commitHeld(projectionPath)
+	}
 	return nil
 }
 
 // commitHeld compiles the writes held for the file at projectionPath, and
-// drops them either way: the file is the image's from then on.
+// drops them either way: the file is the image's from then on. The caller
+// holds changing, and keeps calls off projectionPath.
 func (fsys *nfsFileSystem) commitHeld(projectionPath string) error {
 	fsys.mu.Lock()
 	held, ok := fsys.pending[projectionPath]
-	delete(fsys.pending, projectionPath)
+	var contents []byte
+	if ok {
+		contents = held.contents
+	}
 	fsys.mu.Unlock()
 	if !ok {
 		return nil
 	}
 
-	err := fsys.writeProjection(context.Background(), projectionPath, held.contents)
-	fsys.contentsChanged(projectionPath)
+	err := fsys.writeProjection(context.Background(), projectionPath, contents)
+	fsys.mu.Lock()
+	delete(fsys.pending, projectionPath)
+	fsys.contentsChangedLocked(projectionPath)
+	fsys.mu.Unlock()
 	if err != nil {
 		return pathError("write", projectionPath, errnoFor(err))
 	}
@@ -373,23 +654,46 @@ func (fsys *nfsFileSystem) commitHeld(projectionPath string) error {
 func (fsys *nfsFileSystem) entryFor(projectionPath string) (protocol.Entry, syscall.Errno) {
 	fsys.mu.Lock()
 	held, ok := fsys.pending[projectionPath]
+	var size int
+	if ok {
+		size = len(held.contents)
+	}
 	fsys.mu.Unlock()
 	if ok {
-		return protocol.Entry{Name: path.Base(projectionPath), Kind: protocol.File, Size: uint64(len(held.contents)), Writable: true}, 0
+		return protocol.Entry{Name: path.Base(projectionPath), Kind: protocol.File, Size: uint64(size), Writable: true}, 0
 	}
 	return fsys.entryForPath(projectionPath)
 }
 
-func (fsys *nfsFileSystem) contentsToRead(projectionPath string) ([]byte, error) {
+// contentsToRead answers the contents at projectionPath, whose entry was
+// just taken: the writes held for it, an editor's file or an error as they
+// are, or what the image renders. A rendering serves the reads that follow for
+// a second, while the entry they take is the same and unless a change of the
+// file began while the image rendered it.
+func (fsys *nfsFileSystem) contentsToRead(projectionPath string, entry protocol.Entry) ([]byte, error) {
 	fsys.mu.Lock()
-	if held, ok := fsys.pending[projectionPath]; ok {
+	held, ok := fsys.pending[projectionPath]
+	if ok {
+		contents := append([]byte(nil), held.contents...)
 		fsys.mu.Unlock()
-		return append([]byte(nil), held.contents...), nil
+		return contents, nil
 	}
-	if cached, ok := fsys.reads[projectionPath]; ok && time.Since(cached.read) < readFreshness {
+	fsys.mu.Unlock()
+	if contents, ok := fsys.overlay.Read(projectionPath); ok {
+		return contents, nil
+	}
+	if contents, ok := fsys.errors.Read(projectionPath); ok {
+		return contents, nil
+	}
+
+	fsys.mu.Lock()
+	cached, ok := fsys.reads[projectionPath]
+	if ok && time.Since(cached.read) < readFreshness && cached.size == entry.Size && cached.modified == entry.Modified {
 		fsys.mu.Unlock()
 		return cached.contents, nil
 	}
+	mark := fsys.markLocked(projectionPath)
+	wasBusy := fsys.isBusyLocked(projectionPath)
 	fsys.mu.Unlock()
 
 	contents, err := fsys.contentsForPath(projectionPath)
@@ -397,7 +701,10 @@ func (fsys *nfsFileSystem) contentsToRead(projectionPath string) ([]byte, error)
 		return nil, err
 	}
 	fsys.mu.Lock()
-	fsys.reads[projectionPath] = cachedRead{contents: contents, read: time.Now()}
+	_, heldNow := fsys.pending[projectionPath]
+	if !heldNow && !wasBusy && !fsys.isBusyLocked(projectionPath) && fsys.markLocked(projectionPath) == mark {
+		fsys.reads[projectionPath] = cachedRead{contents: contents, read: time.Now(), size: entry.Size, modified: entry.Modified}
+	}
 	fsys.mu.Unlock()
 	return contents, nil
 }
@@ -422,7 +729,7 @@ func (fsys *nfsFileSystem) infoFor(projectionPath string, entry protocol.Entry, 
 			Nlink:  links,
 			UID:    fsys.uid,
 			GID:    fsys.gid,
-			Fileid: stableInodeFor(projectionPath),
+			Fileid: fsys.ids.idFor(projectionPath),
 		},
 	}
 }
@@ -440,6 +747,7 @@ func (fsys *nfsFileSystem) modificationTime(projectionPath string, entry protoco
 	if _, ok := fsys.pending[projectionPath]; !ok {
 		if previous, seen := fsys.sizes[projectionPath]; seen && previous != entry.Size {
 			fsys.changed[projectionPath] = fsys.nowLocked()
+			delete(fsys.reads, projectionPath)
 		}
 		fsys.sizes[projectionPath] = entry.Size
 	}
@@ -509,6 +817,10 @@ func (fsys *nfsFileSystem) contentsChanged(projectionPath string) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 
+	fsys.contentsChangedLocked(projectionPath)
+}
+
+func (fsys *nfsFileSystem) contentsChangedLocked(projectionPath string) {
 	fsys.changed[projectionPath] = fsys.nowLocked()
 	delete(fsys.reads, projectionPath)
 	delete(fsys.sizes, projectionPath)
@@ -562,15 +874,33 @@ func isSillyRenameName(name string) bool {
 	return strings.HasPrefix(name, ".nfs")
 }
 
-// writeAt writes data at offset into the file at projectionPath, held in
-// pending or in the overlay.
-func (fsys *nfsFileSystem) writeAt(kind nfsFileKind, projectionPath string, data []byte, offset int64) error {
+// writeAt writes data at offset into file, held in pending or in the
+// overlay, wherever file is by now.
+func (fsys *nfsFileSystem) writeAt(file *nfsFile, data []byte, offset int64) error {
+	if offset < 0 {
+		return pathError("write", file.path, syscall.EINVAL)
+	}
+	if offset > maxFileSize || int64(len(data)) > maxFileSize-offset {
+		return pathError("write", file.path, syscall.EFBIG)
+	}
+	fsys.changing.Lock()
+	defer fsys.changing.Unlock()
+	projectionPath, ok := fsys.ids.pathFor(file.id)
+	if !ok {
+		return pathError("write", file.path, syscall.ESTALE)
+	}
+	kind, errno := fsys.writeKind(projectionPath)
+	if errno != 0 {
+		return pathError("write", projectionPath, errno)
+	}
+
 	if kind == overlayFile {
 		contents, ok := fsys.overlay.Read(projectionPath)
 		if !ok {
 			return pathError("write", projectionPath, syscall.ENOENT)
 		}
 		_ = fsys.overlay.Write(context.Background(), projectionPath, patched(contents, data, offset))
+		fsys.contentsChanged(projectionPath)
 		return nil
 	}
 
@@ -585,16 +915,33 @@ func (fsys *nfsFileSystem) writeAt(kind nfsFileKind, projectionPath string, data
 	return nil
 }
 
-func (fsys *nfsFileSystem) truncate(kind nfsFileKind, projectionPath string, size int64) error {
+// truncate resizes file, held in pending or in the overlay, wherever file is
+// by now.
+func (fsys *nfsFileSystem) truncate(file *nfsFile, size int64) error {
 	if size < 0 {
-		return pathError("truncate", projectionPath, syscall.EINVAL)
+		return pathError("truncate", file.path, syscall.EINVAL)
 	}
+	if size > maxFileSize {
+		return pathError("truncate", file.path, syscall.EFBIG)
+	}
+	fsys.changing.Lock()
+	defer fsys.changing.Unlock()
+	projectionPath, ok := fsys.ids.pathFor(file.id)
+	if !ok {
+		return pathError("truncate", file.path, syscall.ESTALE)
+	}
+	kind, errno := fsys.writeKind(projectionPath)
+	if errno != 0 {
+		return pathError("truncate", projectionPath, errno)
+	}
+
 	if kind == overlayFile {
 		contents, ok := fsys.overlay.Read(projectionPath)
 		if !ok {
 			return pathError("truncate", projectionPath, syscall.ENOENT)
 		}
 		_ = fsys.overlay.Write(context.Background(), projectionPath, resizedContents(contents, int(size)))
+		fsys.contentsChanged(projectionPath)
 		return nil
 	}
 
@@ -617,8 +964,26 @@ func (fsys *nfsFileSystem) truncate(kind nfsFileKind, projectionPath string, siz
 	return nil
 }
 
+// writeKind answers where writes to projectionPath are kept now: held for
+// the image, or in the overlay. The caller holds changing.
+func (fsys *nfsFileSystem) writeKind(projectionPath string) (nfsFileKind, syscall.Errno) {
+	fsys.mu.Lock()
+	_, held := fsys.pending[projectionPath]
+	fsys.mu.Unlock()
+	if held {
+		return pendingFile, 0
+	}
+	if _, ok := fsys.overlay.Stat(projectionPath); ok {
+		return overlayFile, 0
+	}
+	if isProjectedTonelFilePath(projectionPath) {
+		return pendingFile, 0
+	}
+	return 0, syscall.EROFS
+}
+
 // hold makes sure writes to projectionPath are held, starting from what the
-// image has when none are yet.
+// image has when none are yet. The caller holds changing.
 func (fsys *nfsFileSystem) hold(projectionPath string) error {
 	fsys.mu.Lock()
 	_, ok := fsys.pending[projectionPath]
@@ -732,10 +1097,12 @@ const (
 )
 
 // nfsFile is what go-nfs opens for one call: a snapshot to read, or a view
-// on the writes held for a file.
+// on the writes held for a file. It acts on the file it was opened on,
+// wherever that file is by then.
 type nfsFile struct {
 	fsys     *nfsFileSystem
 	name     string
+	id       uint64
 	path     string
 	kind     nfsFileKind
 	contents []byte
@@ -743,7 +1110,7 @@ type nfsFile struct {
 }
 
 func (fsys *nfsFileSystem) newFile(name string, projectionPath string, kind nfsFileKind) *nfsFile {
-	return &nfsFile{fsys: fsys, name: name, path: projectionPath, kind: kind}
+	return &nfsFile{fsys: fsys, name: name, id: fsys.ids.idFor(projectionPath), path: projectionPath, kind: kind}
 }
 
 func (f *nfsFile) Name() string {
@@ -754,7 +1121,7 @@ func (f *nfsFile) Write(data []byte) (int, error) {
 	if f.kind == snapshotFile {
 		return 0, pathError("write", f.path, syscall.EBADF)
 	}
-	if err := f.fsys.writeAt(f.kind, f.path, data, f.offset); err != nil {
+	if err := f.fsys.writeAt(f, data, f.offset); err != nil {
 		return 0, err
 	}
 	f.offset += int64(len(data))
@@ -768,10 +1135,21 @@ func (f *nfsFile) Read(data []byte) (int, error) {
 }
 
 func (f *nfsFile) ReadAt(data []byte, offset int64) (int, error) {
+	if offset < 0 {
+		return 0, pathError("read", f.path, syscall.EINVAL)
+	}
 	contents := f.contents
 	if f.kind != snapshotFile {
+		projectionPath, ok := f.fsys.ids.pathFor(f.id)
+		if !ok {
+			return 0, pathError("read", f.path, syscall.ESTALE)
+		}
+		entry, errno := f.fsys.entryFor(projectionPath)
+		if errno != 0 {
+			return 0, pathError("read", projectionPath, errno)
+		}
 		var err error
-		if contents, err = f.fsys.contentsToRead(f.path); err != nil {
+		if contents, err = f.fsys.contentsToRead(projectionPath, entry); err != nil {
 			return 0, err
 		}
 	}
@@ -813,7 +1191,7 @@ func (f *nfsFile) Truncate(size int64) error {
 	if f.kind == snapshotFile {
 		return pathError("truncate", f.path, syscall.EBADF)
 	}
-	return f.fsys.truncate(f.kind, f.path, size)
+	return f.fsys.truncate(f, size)
 }
 
 type nfsFileInfo struct {
@@ -832,15 +1210,12 @@ func (info *nfsFileInfo) IsDir() bool        { return info.mode.IsDir() }
 func (info *nfsFileInfo) Sys() any           { return info.sys }
 
 // nfsHandler answers go-nfs for the one export: it mounts the projection,
-// and names each path by a number that holds for the daemon's life.
+// and names each file by its id, which follows it through renames.
 type nfsHandler struct {
 	fsys *nfsFileSystem
 
 	mu       sync.Mutex
-	ids      map[string]uint64
-	paths    map[uint64][]string
 	listings map[string]cachedListing
-	nextID   uint64
 }
 
 type cachedListing struct {
@@ -851,10 +1226,7 @@ type cachedListing struct {
 func newNFSHandler(fsys *nfsFileSystem) *nfsHandler {
 	return &nfsHandler{
 		fsys:     fsys,
-		ids:      map[string]uint64{},
-		paths:    map[uint64][]string{},
 		listings: map[string]cachedListing{},
-		nextID:   1,
 	}
 }
 
@@ -876,37 +1248,34 @@ func (h *nfsHandler) FSStat(_ context.Context, _ billy.Filesystem, stat *nfs.FSS
 	return nil
 }
 
+// ToHandle answers the handle of what components name. Id 0 names nothing,
+// so the handle of something gone meanwhile is stale.
 func (h *nfsHandler) ToHandle(_ billy.Filesystem, components []string) []byte {
-	key := strings.Join(components, "/")
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	id, ok := h.ids[key]
-	if !ok {
-		id = h.nextID
-		h.nextID++
-		h.ids[key] = id
-		h.paths[id] = append([]string(nil), components...)
-	}
 	handle := make([]byte, 8)
-	binary.BigEndian.PutUint64(handle, id)
+	if projectionPath, errno := h.fsys.ids.resolve(path.Join(components...)); errno == 0 {
+		binary.BigEndian.PutUint64(handle, h.fsys.ids.idFor(projectionPath))
+	}
 	return handle
 }
 
+// FromHandle answers the components of the file a handle names, which carry
+// its id: every name made from them stands for that file wherever it is when
+// used. A handle whose file was removed, or replaced by a rename, is stale.
 func (h *nfsHandler) FromHandle(handle []byte) (billy.Filesystem, []string, error) {
 	if len(handle) != 8 {
 		return nil, nil, errStaleHandle
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	components, ok := h.paths[binary.BigEndian.Uint64(handle)]
+	id := binary.BigEndian.Uint64(handle)
+	projectionPath, ok := h.fsys.ids.pathFor(id)
 	if !ok {
 		return nil, nil, errStaleHandle
 	}
-	return h.fsys, append([]string(nil), components...), nil
+	return h.fsys, componentsFor(id, projectionPath), nil
 }
 
+// InvalidateHandle does nothing: go-nfs calls it with the handle a rename
+// moved, which still names the renamed file, and the file system already
+// retired the handles of what it removed or replaced.
 func (h *nfsHandler) InvalidateHandle(billy.Filesystem, []byte) error {
 	return nil
 }

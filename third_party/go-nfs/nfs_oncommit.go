@@ -1,5 +1,8 @@
 package nfs
 
+// Changed for pharo-image-fs: COMMIT commits the writes a Committer holds
+// (see pifs.go).
+
 import (
 	"bytes"
 	"context"

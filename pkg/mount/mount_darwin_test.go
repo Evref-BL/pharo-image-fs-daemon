@@ -25,7 +25,7 @@ func TestMountedProjection(t *testing.T) {
 		t.Skip("mounts a file system; set PIFS_MOUNT_TEST=1 on a disposable machine")
 	}
 
-	client := newMemoryClient(map[string]string{
+	client := newGatedClient(map[string]string{
 		objectPath:                    "Class { #name : 'Object' }\n",
 		"/critiques/Kernel/Object.md": "No critique.\n",
 	})
@@ -105,11 +105,61 @@ func TestMountedProjection(t *testing.T) {
 		if err := os.WriteFile(temp, []byte("Class { #name : 'Object', #comment : 'renamed' }\n"), 0o644); err != nil {
 			t.Fatalf("write temp: %v", err)
 		}
+		tempInfo, err := os.Stat(temp)
+		if err != nil {
+			t.Fatalf("stat temp: %v", err)
+		}
 		if err := os.Rename(temp, object); err != nil {
 			t.Fatalf("rename: %v", err)
 		}
 		if contents := client.contents(objectPath); !strings.Contains(contents, "renamed") {
 			t.Fatalf("the image did not get the rename: %q", contents)
+		}
+		saved := tempInfo.Sys().(*syscall.Stat_t).Ino
+		if id := server.fsys.ids.idFor(objectPath); id != saved {
+			t.Fatalf("the server gave the saved file id %d, the temp file had %d", id, saved)
+		}
+		// Past actimeo=1, so that the client asks the server for the renamed
+		// file's attributes instead of answering from its cache.
+		time.Sleep(1500 * time.Millisecond)
+		objectInfo, err := os.Stat(object)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if renamed := objectInfo.Sys().(*syscall.Stat_t).Ino; renamed != saved {
+			t.Fatalf("the saved file should keep the temp file's inode %d, has %d", saved, renamed)
+		}
+	})
+
+	t.Run("a lookup answers while a compile runs", func(t *testing.T) {
+		client.put("/tonel/Kernel/Fresh.class.st", "Class { #name : 'Fresh' }\n")
+		started, open := client.holdNext("write")
+		defer open()
+		saved := make(chan error, 1)
+		go func() {
+			saved <- os.WriteFile(object, []byte("Class { #name : 'Object', #comment : 'held' }\n"), 0o644)
+		}()
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the save did not reach the image")
+		}
+		looked := make(chan error, 1)
+		go func() {
+			_, err := os.Stat(filepath.Join(mountPoint, "tonel", "Kernel", "Fresh.class.st"))
+			looked <- err
+		}()
+		select {
+		case err := <-looked:
+			if err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("a lookup waited for the compile")
+		}
+		open()
+		if err := <-saved; err != nil {
+			t.Fatalf("save: %v", err)
 		}
 	})
 

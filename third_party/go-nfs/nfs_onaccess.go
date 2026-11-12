@@ -1,5 +1,8 @@
 package nfs
 
+// Changed for pharo-image-fs: ACCESS no longer grants modifying an object
+// whose mode has no owner write bit.
+
 import (
 	"bytes"
 	"context"

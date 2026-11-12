@@ -1,5 +1,7 @@
 module github.com/willscott/go-nfs
 
+// Changed for pharo-image-fs: only the requirements of the files kept here.
+
 go 1.19
 
 require (

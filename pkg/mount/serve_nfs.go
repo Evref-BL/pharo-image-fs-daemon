@@ -8,6 +8,13 @@ import (
 	nfs "github.com/willscott/go-nfs"
 )
 
+// concurrentCalls is how many calls on the mount's connection are served at
+// once. A call waiting for a change, or on what it changes, takes one, so it
+// is above the 128 writes the macOS client keeps in flight, and what queues
+// behind a stuck compile does not hold up the rest. Writes are 64 KiB at most
+// (FSINFO), which bounds what the queued calls hold.
+const concurrentCalls = 256
+
 // nfsServer serves the projection over NFSv3 on a loopback port of its own.
 type nfsServer struct {
 	fsys     *nfsFileSystem
@@ -28,7 +35,12 @@ func startNFSServer(client protocol.Client, logger projectionLogger) (*nfsServer
 	fsys.logger = logger
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &nfsServer{fsys: fsys, listener: listener, cancel: cancel, done: make(chan error, 1)}
-	nfsServerInstance := &nfs.Server{Handler: newNFSHandler(fsys), Context: ctx}
+	nfsServerInstance := &nfs.Server{
+		Handler:            newNFSHandler(fsys),
+		Context:            ctx,
+		ConcurrentHandlers: concurrentCalls,
+		PanicHandler:       fsys.recovered,
+	}
 	go func() {
 		server.done <- nfsServerInstance.Serve(listener)
 	}()

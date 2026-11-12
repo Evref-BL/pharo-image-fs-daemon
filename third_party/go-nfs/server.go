@@ -1,5 +1,8 @@
 package nfs
 
+// Changed for pharo-image-fs: Server.ConcurrentHandlers, from go-nfs's main
+// branch (3946bf8), and Server.PanicHandler, after the open upstream PR #151.
+
 import (
 	"bytes"
 	"context"
@@ -13,6 +16,14 @@ import (
 type Server struct {
 	Handler
 	ID [8]byte
+	// ConcurrentHandlers is how many requests on one connection may be
+	// handled at the same time. Zero or one handles them one at a time, in
+	// order, as before. A larger value requires the Handler and the
+	// filesystems it returns to be safe for concurrent use.
+	ConcurrentHandlers int
+	// PanicHandler, when set, recovers a panic in a request's handler: it is
+	// given what was recovered, and answers the RPC reply code to send.
+	PanicHandler func(recovered any) ResponseCode
 	context.Context
 }
 

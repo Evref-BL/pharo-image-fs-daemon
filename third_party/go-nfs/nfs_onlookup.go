@@ -1,5 +1,9 @@
 package nfs
 
+// Changed for pharo-image-fs: an error from the file system keeps its errno's
+// meaning (see pifs.go), STALE included, and the attributes of the object
+// found are taken through the handle answered.
+
 import (
 	"bytes"
 	"context"
@@ -39,8 +43,11 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
 	dirInfo, err := fs.Lstat(fs.Join(p...))
-	if err != nil || !dirInfo.IsDir() {
-		return &NFSStatusError{NFSStatusNotDir, err}
+	if err != nil {
+		return &NFSStatusError{statusFromError(err, NFSStatusNotDir), err}
+	}
+	if !dirInfo.IsDir() {
+		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
 
 	// Special cases for "." and ".."
@@ -72,11 +79,17 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 
 	reqPath := append(p, string(obj.Filename))
 	if _, err = fs.Lstat(fs.Join(reqPath...)); err != nil {
-		return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
+		return &NFSStatusError{statusFromError(err, NFSStatusNoEnt), err}
 	}
 
 	newHandle := userHandle.ToHandle(fs, reqPath)
-	resp, err := lookupSuccessResponse(newHandle, reqPath, p, fs)
+	// The object's attributes are taken through the handle answered, so they
+	// are its own even if a rename moved the name meanwhile.
+	_, objPath, err := userHandle.FromHandle(newHandle)
+	if err != nil {
+		return &NFSStatusError{NFSStatusStale, err}
+	}
+	resp, err := lookupSuccessResponse(newHandle, objPath, p, fs)
 	if err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}

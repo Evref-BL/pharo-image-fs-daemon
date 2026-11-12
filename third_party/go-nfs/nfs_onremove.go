@@ -1,5 +1,10 @@
 package nfs
 
+// Changed for pharo-image-fs: from go-nfs's main branch (3946bf8), REMOVE
+// refuses a directory, and RMDIR a file or a non-empty directory; an error
+// from the file system keeps its errno's meaning (see pifs.go), STALE
+// included.
+
 import (
 	"bytes"
 	"context"
@@ -10,6 +15,10 @@ import (
 )
 
 func onRemove(ctx context.Context, w *response, userHandle Handler) error {
+	return onRemoveObj(ctx, w, userHandle, false)
+}
+
+func onRemoveObj(ctx context.Context, w *response, userHandle Handler, directory bool) error {
 	w.errorFmt = wccDataErrorFormatter
 	obj := DirOpArg{}
 	if err := xdr.Read(w.req.Body, &obj); err != nil {
@@ -45,6 +54,36 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 	preCacheData := ToFileAttribute(dirInfo, fullPath).AsCache()
 
 	toDelete := fs.Join(append(path, string(obj.Filename))...)
+	toRemoveStat, err := fs.Stat(toDelete)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &NFSStatusError{NFSStatusNoEnt, err}
+		}
+		if os.IsPermission(err) {
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
+
+	}
+
+	if directory && !toRemoveStat.IsDir() {
+		return &NFSStatusError{NFSStatusNotDir, nil}
+	} else if !directory && toRemoveStat.IsDir() {
+		return &NFSStatusError{NFSStatusIsDir, nil}
+	}
+
+	if directory {
+		contents, err := fs.ReadDir(toDelete)
+		if err != nil {
+			if os.IsPermission(err) {
+				return &NFSStatusError{NFSStatusAccess, err}
+			}
+			return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
+		}
+		if len(contents) > 0 {
+			return &NFSStatusError{NFSStatusNotEmpty, nil}
+		}
+	}
 	toDeleteHandle := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
 
 	err = fs.Remove(toDelete)
@@ -55,7 +94,7 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 		if os.IsPermission(err) {
 			return &NFSStatusError{NFSStatusAccess, err}
 		}
-		return &NFSStatusError{NFSStatusIO, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
 	}
 
 	if err := userHandle.InvalidateHandle(fs, toDeleteHandle); err != nil {

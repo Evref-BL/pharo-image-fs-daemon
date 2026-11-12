@@ -1,5 +1,9 @@
 package nfs
 
+// Changed for pharo-image-fs: FSINFO does not claim hard links, which LINK
+// refuses, and advertises the reads onRead serves and the writes the request
+// framing accepts, not 1 GiB.
+
 import (
 	"bytes"
 	"context"
@@ -18,6 +22,10 @@ const (
 	// FSInfoPropertyCanSetTime can the FS support setting access/mod times?
 	FSInfoPropertyCanSetTime = 0x0010
 )
+
+// MaxWrite is the largest write advertised. A WRITE must fit, with its RPC
+// header, in maxRequestFragmentBytes.
+const MaxWrite = 64 << 10
 
 func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 	roothandle, err := xdr.ReadOpaque(w.req.Body)
@@ -51,11 +59,11 @@ func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	res := fsinfores{
-		Rtmax:       1 << 30,
-		Rtpref:      1 << 30,
+		Rtmax:       MaxRead,
+		Rtpref:      MaxRead,
 		Rtmult:      4096,
-		Wtmax:       1 << 30,
-		Wtpref:      1 << 30,
+		Wtmax:       MaxWrite,
+		Wtpref:      MaxWrite,
 		Wtmult:      4096,
 		Dtpref:      8192,
 		Maxfilesize: 1 << 62, // wild guess. this seems big.
@@ -64,8 +72,8 @@ func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	// TODO: these aren't great indications of support, really.
+	// LINK always refuses, so hard links are not claimed.
 	if _, ok := fs.(billy.Symlink); ok {
-		res.Properties |= FSInfoPropertyLink
 		res.Properties |= FSInfoPropertySymlink
 	}
 	// TODO: if the nfs share spans multiple virtual mounts, may need

@@ -1,5 +1,8 @@
 package nfs
 
+// Changed for pharo-image-fs: an error from the file system keeps its errno's
+// meaning (see pifs.go), STALE included.
+
 import (
 	"bytes"
 	"context"
@@ -49,7 +52,7 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	} else {
 		if s, err := fs.Stat(fs.Join(path...)); err != nil {
-			return &NFSStatusError{NFSStatusAccess, err}
+			return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 		} else if !s.IsDir() {
 			return &NFSStatusError{NFSStatusNotDir, nil}
 		}
