@@ -6,7 +6,6 @@ require (
 	github.com/go-git/go-billy/v5 v5.6.0
 	github.com/hanwen/go-fuse/v2 v2.12.1
 	github.com/willscott/go-nfs v0.0.4
-	github.com/winfsp/cgofuse v1.6.0
 	golang.org/x/sys v0.28.0
 )
 
