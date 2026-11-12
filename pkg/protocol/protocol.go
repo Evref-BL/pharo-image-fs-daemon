@@ -104,11 +104,25 @@ func NewHTTPClient(rawBaseURL string) (*HTTPClient, error) {
 		return nil, fmt.Errorf("endpoint must be an absolute HTTP URL")
 	}
 
+	// The image's Zinc server answers 503 past 32 open connections and closes
+	// one idle for 30 s. Calls run concurrently, so they share a pool well
+	// under that cap, which leaves room for calls given up on that the image
+	// still serves, and close idle connections before Zinc does: a POST sent
+	// on a connection Zinc is closing cannot be retried.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxConnsPerHost = maxImageConnections
+	transport.MaxIdleConnsPerHost = maxImageConnections
+	transport.IdleConnTimeout = 20 * time.Second
+
 	return &HTTPClient{
 		baseURL:    parsedURL,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: &http.Client{Timeout: 30 * time.Second, Transport: transport},
 	}, nil
 }
+
+// maxImageConnections bounds the connections open to the image at once; one
+// Pharo process renders, so more would only queue there.
+const maxImageConnections = 16
 
 func (c *HTTPClient) List(ctx context.Context, projectionPath string) ([]Entry, error) {
 	var response listResponse
