@@ -10,12 +10,12 @@ Tonel synchronization.
 
 ## Requirements
 
-- Go, for development builds
-- macOS with [fuse-t](https://www.fuse-t.org/) installed
+- macOS, with nothing to install: the daemon serves NFSv3 on a loopback port
+  and mounts it with the system's `mount_nfs`, as the user
 - a running `pharo-image-fs` projection endpoint
+- Go, for development builds
 
-Users should normally run a prebuilt release binary. Go is not required to run a
-prebuilt daemon binary, but the platform FUSE dependency is still required.
+Users should normally run a prebuilt release binary.
 
 ## Build
 
@@ -55,6 +55,10 @@ directory.
 ```sh
 go test ./...
 ```
+
+The test that mounts a projection runs only where `PIFS_MOUNT_TEST=1`, which
+CI sets: it drives the kernel's NFS client, which once panicked a Mac running
+it, so it belongs on machines that can be thrown away.
 
 The daemon does not parse or validate Pharo code. It owns mount lifecycle,
 filesystem callbacks, transport, timeouts, and generic filesystem errors.

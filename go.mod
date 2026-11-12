@@ -14,6 +14,4 @@ require (
 	golang.org/x/sys v0.24.0 // indirect
 )
 
-replace github.com/winfsp/cgofuse => ./third_party/cgofuse
-
 replace github.com/willscott/go-nfs => ./third_party/go-nfs
