@@ -9,7 +9,7 @@ on:
 
 jobs:
   macos:
-    name: macOS (NFS, mounted)
+    name: macOS (NFS)
     runs-on: macos-26
 
     steps:
@@ -34,7 +34,7 @@ jobs:
         run: go test -count=1 -tags fusetest ./pkg/mount
 
   linux:
-    name: Linux (FUSE, mounted, ${{ matrix.runner }})
+    name: Linux (FUSE, ${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
