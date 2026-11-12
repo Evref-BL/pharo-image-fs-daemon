@@ -8,6 +8,14 @@ This repository contains only the Go daemon. The Pharo backend lives in
 source projection, parsing, compilation, transactional writes, critiques, and
 Tonel synchronization.
 
+> **This branch keeps the shelved Windows adapter**, which `main` dropped: a
+> mount through [WinFsp](https://winfsp.dev/) with
+> [cgofuse](https://github.com/winfsp/cgofuse). It builds, and CI vets it, but
+> nothing releases or starts it, no test of it runs, and it predates the core
+> the macOS and Linux adapters drive, so it lacks their fixes. Windows support
+> would take an adapter on that core, a Windows release asset, a way for PIFS
+> to start the daemon without a shell, and a Windows runner that mounts.
+
 ## Requirements
 
 - macOS, with nothing to install: the daemon serves NFSv3 on a loopback port

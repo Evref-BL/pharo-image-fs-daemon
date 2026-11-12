@@ -313,6 +313,15 @@ func writableEntryForPath(projectionPath string, entry protocol.Entry) protocol.
 	return entry
 }
 
+func stableInodeFor(projectionPath string) uint64 {
+	var hash uint64 = 14695981039346656037
+	for _, b := range []byte(projectionPath) {
+		hash ^= uint64(b)
+		hash *= 1099511628211
+	}
+	return hash
+}
+
 // permissionsFor answers the permission bits of entry: writable entries are
 // the owner's to change, the rest read-only.
 func permissionsFor(entry protocol.Entry) uint32 {
