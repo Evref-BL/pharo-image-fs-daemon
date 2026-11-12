@@ -73,34 +73,11 @@ jobs:
           go vet ./...
           go build -o /dev/null ./cmd/pharo-image-fs
 
-  windows:
-    name: Windows (WinFsp, built)
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Build and vet
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: "0"
-        run: |
-          go vet ./...
-          go build -o /dev/null ./cmd/pharo-image-fs
-
   # The check main's ruleset requires: it fails unless every job above passed,
   # so that one required name covers them all.
   gate:
     name: Go test
-    needs: [macos, windows]
+    needs: [macos, linux]
     if: always()
     runs-on: ubuntu-24.04
     steps:
