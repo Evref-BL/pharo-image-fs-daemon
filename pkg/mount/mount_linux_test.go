@@ -28,6 +28,15 @@ func TestTheAdapterReadsLinuxsOpenFlags(t *testing.T) {
 	}
 }
 
+func TestAThreadBelongsToItsProcess(t *testing.T) {
+	if group := threadGroupOf(uint32(unix.Gettid())); group != uint32(os.Getpid()) {
+		t.Fatalf("this thread should belong to process %d, got %d", os.Getpid(), group)
+	}
+	if group := threadGroupOf(1 << 30); group != 1<<30 {
+		t.Fatalf("a thread /proc does not know should stand for itself, got %d", group)
+	}
+}
+
 // mountTestOnly skips a test that mounts unless PIFS_MOUNT_TEST=1, which CI
 // sets: mounts belong on machines that can be thrown away.
 func mountTestOnly(t *testing.T) {
@@ -221,6 +230,9 @@ func TestMountedProjectionOnLinux(t *testing.T) {
 #comment : 'group' }
 EOF
 } > "$F"`, "group"},
+			{"a here-document", `cat > "$F" <<'EOF'
+Class { #name : 'Object', #comment : 'heredoc' }
+EOF`, "heredoc"},
 			{"cp", `printf "Class { #name : 'Object', #comment : 'cp' }\n" > source.st && cp source.st "$F"`, "cp"},
 			{"python", `python3 -c "
 import sys

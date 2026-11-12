@@ -46,6 +46,11 @@ func Mount(mountPoint string, client protocol.Client, config Config) error {
 	if err := checkFuse(); err != nil {
 		return err
 	}
+	// From now on, so that a signal while mounting unmounts once mounted
+	// rather than ending the daemon with its mount left behind.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, stopSignals()...)
+	defer signal.Stop(signals)
 
 	logger := log.New(os.Stderr, "pharo-image-fs: ", log.LstdFlags)
 	fsys := newFuseFileSystem(client)
@@ -70,8 +75,6 @@ func Mount(mountPoint string, client protocol.Client, config Config) error {
 		return errors.New("this kernel's FUSE does not pass O_TRUNC with an open, which the mount needs to tell a save from truncate(2)")
 	}
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, stopSignals()...)
 	gone := make(chan struct{})
 	stopWatching := watchImage(client, logger, func() { close(gone) })
 	defer stopWatching()

@@ -146,19 +146,32 @@ type fuseFile struct {
 	node     *fuseNode
 	writable bool
 	appends  bool
+	// syncs says each write is synced, which the kernel does with an fsync
+	// after it.
+	syncs bool
 	// opener is the process that opened the file, 0 when unknown.
 	opener uint32
 
 	// Guarded by the file system's handles.
 	//
-	// wrote says the file wrote since a compile took its writes; base is
-	// what that compile took, which its next writes go on from; refusal is
-	// that compile's error, which each of its closes and fsyncs answers until
-	// it writes again. writingAt is where its writes are held.
+	// wrote says the file wrote since a compile took its writes, and
+	// truncated that it opened truncating since: an open's truncation alone
+	// compiles only at an fsync or once the file is closed for good, since a
+	// shell opens a file, moves the descriptor and closes the first one
+	// before anything is written. writingAt is where its writes are held.
+	//
+	// base is what the compile that took its writes took, which its next
+	// writes go on from while the file has not changed since baseTime;
+	// refusal is that compile's error, which each of its closes and fsyncs
+	// answers until it writes again. syncDue says the kernel's fsync of a
+	// synced write is still to come, which compiles nothing.
 	wrote     bool
-	base      []byte
-	refusal   error
+	truncated bool
 	writingAt string
+	base      []byte
+	baseTime  time.Time
+	refusal   error
+	syncDue   bool
 }
 
 // path answers where the node's file is now.
@@ -220,6 +233,14 @@ func (n *fuseNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut
 		entry, modified, errno = n.fsys.statAt(projectionPath)
 		return errnoError(errno)
 	})
+	if errno == syscall.ESTALE {
+		// Removed or replaced while the call waited: an open descriptor
+		// goes on with its copy.
+		if removed, ok := n.fsys.removedFile(n.id); ok {
+			n.fsys.fillRemovedAttr(&out.Attr, removed, n.id)
+			return 0
+		}
+	}
 	if errno != 0 {
 		return errno
 	}
@@ -229,14 +250,38 @@ func (n *fuseNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut
 
 // Setattr sets a file's size; modes, owners and times belong to the image,
 // so setting them succeeds and changes nothing.
-func (n *fuseNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	if size, ok := in.GetSize(); ok {
+//
+// The kernel takes a SETATTR reply's time without dropping its pages, which
+// only a GETATTR whose time moved does: so the reply never answers a change
+// first. It answers the time without recording what it saw, and after a new
+// size, the file's time moves past the reply's.
+func (n *fuseNode) Setattr(_ context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	size, sized := in.GetSize()
+	if sized {
 		file, _ := f.(*fuseFile)
 		if errno := n.fsys.setSize(n, file, size); errno != 0 {
 			return errno
 		}
 	}
-	return n.Getattr(ctx, f, out)
+	if removed, ok := n.fsys.removedFile(n.id); ok {
+		n.fsys.fillRemovedAttr(&out.Attr, removed, n.id)
+		return 0
+	}
+	projectionPath, errno := n.path()
+	if errno != 0 {
+		return errno
+	}
+	entry, modified, errno := n.fsys.peekAt(projectionPath)
+	if errno != 0 {
+		return errno
+	}
+	n.fsys.fillAttr(&out.Attr, entry, modified, n.id)
+	if sized {
+		n.fsys.mu.Lock()
+		n.fsys.changed[projectionPath] = n.fsys.nowLocked()
+		n.fsys.mu.Unlock()
+	}
+	return 0
 }
 
 func (n *fuseNode) Readdir(context.Context) (fs.DirStream, syscall.Errno) {
@@ -274,6 +319,7 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		node:     n,
 		writable: flags&linuxOpenAccessMode != linuxOpenReadOnly || flags&linuxOpenTruncate != 0,
 		appends:  flags&linuxOpenAppend != 0,
+		syncs:    flags&linuxOpenDataSync != 0,
 		opener:   n.fsys.callerProcess(ctx),
 	}
 	if _, removed := n.fsys.removedFile(n.id); removed {
@@ -281,10 +327,9 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		return file, 0, 0
 	}
 	if !file.writable {
-		if _, errno := n.path(); errno != 0 {
+		if errno := n.fsys.openForReading(file); errno != 0 {
 			return nil, 0, errno
 		}
-		n.fsys.opened(file)
 		n.dropCachedAttributes()
 		return file, fuse.FOPEN_NOFLUSH, 0
 	}
@@ -302,7 +347,7 @@ func (n *fuseNode) Create(ctx context.Context, name string, flags uint32, _ uint
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
-	file := &fuseFile{node: node, writable: true, appends: flags&linuxOpenAppend != 0, opener: n.fsys.callerProcess(ctx)}
+	file := &fuseFile{node: node, writable: true, appends: flags&linuxOpenAppend != 0, syncs: flags&linuxOpenDataSync != 0, opener: n.fsys.callerProcess(ctx)}
 	n.fsys.opened(file)
 	var attributes fuse.AttrOut
 	if errno := node.Getattr(ctx, file, &attributes); errno == 0 {
@@ -331,6 +376,13 @@ func (n *fuseNode) Read(_ context.Context, _ fs.FileHandle, dest []byte, offset 
 		contents = read
 		return err
 	})
+	if errno == syscall.ESTALE {
+		// Removed or replaced while the call waited: an open descriptor
+		// goes on with its copy.
+		if removed, ok := n.fsys.removedFile(n.id); ok {
+			return fuse.ReadResultData(sliceAt(removed.contents, offset, len(dest))), 0
+		}
+	}
 	if errno != 0 {
 		return nil, errno
 	}
@@ -362,16 +414,26 @@ func (n *fuseNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 	if file.opener != 0 && closing != 0 && closing != file.opener {
 		return 0
 	}
-	return n.fsys.compile(file)
+	return n.fsys.compile(file, false)
 }
 
-// Fsync compiles what the file wrote, whoever asks.
+// Fsync compiles what the file wrote, and an open's truncation, whoever
+// asks; but the fsync the kernel makes after each write of a file opened to
+// sync them, which would compile every part of a save.
 func (n *fuseNode) Fsync(_ context.Context, f fs.FileHandle, _ uint32) syscall.Errno {
 	file, ok := f.(*fuseFile)
 	if !ok || !file.writable {
 		return 0
 	}
-	return n.fsys.compile(file)
+	n.fsys.handles.Lock()
+	if file.syncDue {
+		file.syncDue = false
+		refusal := file.refusal
+		n.fsys.handles.Unlock()
+		return errnoOf(refusal)
+	}
+	n.fsys.handles.Unlock()
+	return n.fsys.compile(file, true)
 }
 
 // Release compiles what no close compiled, once the file's last descriptor
@@ -412,6 +474,7 @@ const (
 	linuxOpenReadOnly   = 0o0
 	linuxOpenTruncate   = 0o1000
 	linuxOpenAppend     = 0o2000
+	linuxOpenDataSync   = 0o10000
 
 	renameNoReplace = 1
 	renameExchange  = 2
@@ -518,6 +581,46 @@ func (fsys *fuseFileSystem) opened(file *fuseFile) {
 	fsys.open[file.node.id]++
 }
 
+// openForReading counts file among its id's open files, once no change of
+// its path runs: a remove or a rename over it either counted it, and kept a
+// copy for it, or ended, and the file is gone (ESTALE: the kernel looks the
+// name up again).
+func (fsys *fuseFileSystem) openForReading(file *fuseFile) syscall.Errno {
+	fsys.opened(file)
+	fsys.mu.Lock()
+	for {
+		projectionPath, errno := file.node.path()
+		if errno != 0 || !fsys.isBusyLocked(projectionPath) {
+			break
+		}
+		fsys.settled.Wait()
+	}
+	fsys.mu.Unlock()
+	if _, errno := file.node.path(); errno == 0 {
+		return 0
+	}
+	if _, ok := fsys.removedFile(file.node.id); ok {
+		return 0
+	}
+	fsys.closed(file)
+	return syscall.ESTALE
+}
+
+// closed forgets file among its id's open files, and answers whether it was
+// the last.
+func (fsys *fuseFileSystem) closed(file *fuseFile) bool {
+	fsys.handles.Lock()
+	defer fsys.handles.Unlock()
+	id := file.node.id
+	fsys.open[id]--
+	if fsys.open[id] > 0 {
+		return false
+	}
+	delete(fsys.open, id)
+	delete(fsys.removed, id)
+	return true
+}
+
 func (fsys *fuseFileSystem) removedFile(id uint64) (removedFile, bool) {
 	fsys.handles.Lock()
 	defer fsys.handles.Unlock()
@@ -538,6 +641,11 @@ func (fsys *fuseFileSystem) openForWriting(file *fuseFile, truncates bool) sysca
 		return errno
 	}
 	entry, errno := fsys.entryFor(projectionPath)
+	if errno == syscall.ENOENT {
+		// The kernel's name outlived the file: ESTALE makes it look the
+		// name up again, and create it when the open asks.
+		return syscall.ESTALE
+	}
 	if errno != 0 {
 		return errno
 	}
@@ -547,7 +655,8 @@ func (fsys *fuseFileSystem) openForWriting(file *fuseFile, truncates bool) sysca
 	if !entry.Writable {
 		return syscall.EROFS
 	}
-	if _, errno := fsys.writeKind(projectionPath); errno != 0 {
+	place, errno := fsys.writeKind(projectionPath)
+	if errno != 0 {
 		return errno
 	}
 	if truncates {
@@ -559,9 +668,12 @@ func (fsys *fuseFileSystem) openForWriting(file *fuseFile, truncates bool) sysca
 		if !resized {
 			fsys.startSaveLocked(projectionPath)
 		}
-		fsys.handles.Lock()
-		fsys.wroteLocked(file, projectionPath)
-		fsys.handles.Unlock()
+		if place == heldForTheImage {
+			fsys.handles.Lock()
+			fsys.holdsWritesLocked(file, projectionPath)
+			file.truncated = true
+			fsys.handles.Unlock()
+		}
 	}
 	fsys.opened(file)
 	return 0
@@ -570,7 +682,14 @@ func (fsys *fuseFileSystem) openForWriting(file *fuseFile, truncates bool) sysca
 // wroteLocked records that file wrote at projectionPath. The caller holds
 // handles.
 func (fsys *fuseFileSystem) wroteLocked(file *fuseFile, projectionPath string) {
+	fsys.holdsWritesLocked(file, projectionPath)
 	file.wrote = true
+	file.syncDue = file.syncs
+}
+
+// holdsWritesLocked records that the writes held at projectionPath carry
+// file's. The caller holds handles.
+func (fsys *fuseFileSystem) holdsWritesLocked(file *fuseFile, projectionPath string) {
 	file.refusal = nil
 	if file.writingAt != "" && file.writingAt != projectionPath {
 		delete(fsys.writers[file.writingAt], file)
@@ -599,10 +718,15 @@ func (fsys *fuseFileSystem) write(file *fuseFile, data []byte, offset int64) sys
 		fsys.handles.Unlock()
 		return 0
 	}
-	base := file.base
+	base, baseTime := file.base, file.baseTime
 	fsys.handles.Unlock()
 
 	projectionPath, errno := file.node.path()
+	if errno != 0 {
+		return errno
+	}
+	base = fsys.baseStill(projectionPath, base, baseTime)
+	place, errno := fsys.writeKind(projectionPath)
 	if errno != 0 {
 		return errno
 	}
@@ -619,10 +743,27 @@ func (fsys *fuseFileSystem) write(file *fuseFile, data []byte, offset int64) sys
 	if err := fsys.writeLocked(projectionPath, data, offset, base); err != nil {
 		return errnoOf(err)
 	}
-	fsys.handles.Lock()
-	fsys.wroteLocked(file, projectionPath)
-	fsys.handles.Unlock()
+	if place == heldForTheImage {
+		fsys.handles.Lock()
+		fsys.wroteLocked(file, projectionPath)
+		fsys.handles.Unlock()
+	}
 	return 0
+}
+
+// baseStill answers base, what a file's last compile took, while the file
+// at projectionPath has not changed since, at baseTime; nil otherwise, so
+// that writes go on from what the file has now.
+func (fsys *fuseFileSystem) baseStill(projectionPath string, base []byte, baseTime time.Time) []byte {
+	if base == nil {
+		return nil
+	}
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	if !fsys.changed[projectionPath].Equal(baseTime) {
+		return nil
+	}
+	return base
 }
 
 // endOf answers how long the file at projectionPath is for a write: its held
@@ -671,12 +812,18 @@ func (fsys *fuseFileSystem) setSize(node *fuseNode, file *fuseFile, size uint64)
 		return 0
 	}
 	var base []byte
+	var baseTime time.Time
 	if file != nil {
-		base = file.base
+		base, baseTime = file.base, file.baseTime
 	}
 	fsys.handles.Unlock()
 
 	projectionPath, errno := node.path()
+	if errno != 0 {
+		return errno
+	}
+	base = fsys.baseStill(projectionPath, base, baseTime)
+	place, errno := fsys.writeKind(projectionPath)
 	if errno != 0 {
 		return errno
 	}
@@ -699,7 +846,7 @@ func (fsys *fuseFileSystem) setSize(node *fuseNode, file *fuseFile, size uint64)
 			return errnoOf(err)
 		}
 	}
-	if file != nil {
+	if file != nil && place == heldForTheImage {
 		fsys.handles.Lock()
 		fsys.wroteLocked(file, projectionPath)
 		fsys.handles.Unlock()
@@ -709,14 +856,16 @@ func (fsys *fuseFileSystem) setSize(node *fuseNode, file *fuseFile, size uint64)
 
 // compile compiles what file wrote, with the writes of every other file held
 // at the same path, and answers the result it has: that of the compile that
-// took its writes, when another took them.
-func (fsys *fuseFileSystem) compile(file *fuseFile) syscall.Errno {
+// took its writes, when another took them. An open's truncation compiles
+// only when truncation says so: at an fsync, or once the file is closed for
+// good.
+func (fsys *fuseFileSystem) compile(file *fuseFile, truncation bool) syscall.Errno {
 	fsys.changing.Lock()
 	fsys.handles.Lock()
-	wrote, refusal := file.wrote, file.refusal
+	due, refusal := file.wrote || truncation && file.truncated, file.refusal
 	_, removed := fsys.removed[file.node.id]
 	fsys.handles.Unlock()
-	if !wrote || removed {
+	if !due || removed {
 		fsys.changing.Unlock()
 		return errnoOf(refusal)
 	}
@@ -741,19 +890,32 @@ func (fsys *fuseFileSystem) commitLocked(projectionPath string) error {
 	held, ok := fsys.pending[projectionPath]
 	var contents []byte
 	if ok {
-		contents = append([]byte(nil), held.contents...)
+		// Not nil when empty: writes go on from it.
+		contents = append([]byte{}, held.contents...)
 	}
 	fsys.mu.Unlock()
 	if !ok {
 		return nil
 	}
 	err := fsys.commitHeld(projectionPath)
+	if err != nil {
+		if _, errno := fsys.entryFor(projectionPath); errno == syscall.ENOENT {
+			// A created file the image refused left with its compile: its
+			// nodes are stale, and the kernel looks its name up again.
+			fsys.ids.removed(projectionPath)
+		}
+	}
+	fsys.mu.Lock()
+	compiledAt := fsys.changed[projectionPath]
+	fsys.mu.Unlock()
 	fsys.handles.Lock()
 	defer fsys.handles.Unlock()
 	for writer := range fsys.writers[projectionPath] {
 		writer.wrote = false
+		writer.truncated = false
 		writer.refusal = err
 		writer.base = contents
+		writer.baseTime = compiledAt
 		writer.writingAt = ""
 	}
 	delete(fsys.writers, projectionPath)
@@ -763,10 +925,10 @@ func (fsys *fuseFileSystem) commitLocked(projectionPath string) error {
 // release forgets file, once its last descriptor is gone.
 func (fsys *fuseFileSystem) release(file *fuseFile) {
 	fsys.handles.Lock()
-	wrote := file.wrote
+	due := file.wrote || file.truncated
 	fsys.handles.Unlock()
-	if wrote {
-		_ = fsys.compile(file)
+	if due {
+		_ = fsys.compile(file, true)
 	}
 
 	fsys.handles.Lock()
@@ -776,15 +938,8 @@ func (fsys *fuseFileSystem) release(file *fuseFile) {
 			delete(fsys.writers, file.writingAt)
 		}
 	}
-	id := file.node.id
-	fsys.open[id]--
-	last := fsys.open[id] <= 0
-	if last {
-		delete(fsys.open, id)
-		delete(fsys.removed, id)
-	}
 	fsys.handles.Unlock()
-	if last {
+	if fsys.closed(file) {
 		fsys.dropUnwrittenCreation(file.node)
 	}
 }
@@ -818,6 +973,10 @@ func (fsys *fuseFileSystem) dropUnwrittenCreation(node *fuseNode) {
 	if _, held := fsys.pending[projectionPath]; held {
 		delete(fsys.pending, projectionPath)
 		fsys.namespaceChangedLocked(projectionPath)
+		if _, errno := fsys.entryForPath(projectionPath); errno == syscall.ENOENT {
+			// Its nodes are stale, and the kernel looks its name up again.
+			fsys.ids.removed(projectionPath)
+		}
 	}
 }
 
@@ -838,6 +997,7 @@ func (fsys *fuseFileSystem) create(parent *fuseNode, name string) (*fuseNode, sy
 		}
 		fsys.overlay.Create(projectionPath, nil)
 	} else {
+		fsys.noteCreateOverBackup(projectionPath)
 		if _, errno := fsys.createFile(projectionPath); errno != 0 {
 			return nil, errno
 		}
@@ -889,7 +1049,7 @@ func (fsys *fuseFileSystem) remove(parent *fuseNode, name string, directory bool
 		held, wasHeld := fsys.pending[projectionPath]
 		delete(fsys.pending, projectionPath)
 		fsys.mu.Unlock()
-		if errno = fsys.unlink(projectionPath); errno != 0 {
+		if errno = fsys.unlinkFile(projectionPath); errno != 0 {
 			if wasHeld {
 				fsys.mu.Lock()
 				fsys.pending[projectionPath] = held
@@ -929,6 +1089,7 @@ func (fsys *fuseFileSystem) keepForOpenFiles(projectionPath string) func() {
 		fsys.removed[id] = &removedFile{contents: contents, modified: modified}
 		for writer := range fsys.writers[projectionPath] {
 			writer.wrote = false
+			writer.truncated = false
 			writer.writingAt = ""
 		}
 		delete(fsys.writers, projectionPath)
@@ -984,10 +1145,6 @@ func (fsys *fuseFileSystem) rename(oldParent *fuseNode, oldName string, newParen
 		return errnoOf(err)
 	}
 	kept := fsys.keepForOpenFiles(newPath)
-	fsys.mu.Lock()
-	delete(fsys.pending, newPath)
-	fsys.mu.Unlock()
-
 	errno = fsys.projection.rename(oldPath, newPath)
 	fsys.namespaceChanged(oldPath)
 	fsys.namespaceChanged(newPath)
@@ -995,7 +1152,13 @@ func (fsys *fuseFileSystem) rename(oldParent *fuseNode, oldName string, newParen
 		fsys.showHiddenClass(newPath)
 		return errno
 	}
+	// What was held for the file the rename replaced goes with it, to its
+	// open descriptors' copy.
+	fsys.mu.Lock()
+	delete(fsys.pending, newPath)
+	fsys.mu.Unlock()
 	kept()
+	fsys.renamedOver(oldPath, newPath)
 	fsys.ids.renamed(oldPath, newPath)
 	return 0
 }

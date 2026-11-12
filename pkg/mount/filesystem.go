@@ -56,6 +56,10 @@ type fileSystem struct {
 	listsDirectoriesOnStat bool
 
 	changing sync.Mutex
+	// overBackup holds the names a create took from a class an editor's
+	// backup rename hid, until a compile there succeeds. Guarded by
+	// changing.
+	overBackup map[string]struct{}
 
 	mu sync.Mutex
 	// busy is what the running change changes, and settled is broadcast when
@@ -88,6 +92,7 @@ func newFileSystem(client protocol.Client) *fileSystem {
 		clock:      time.Now,
 		started:    started,
 		ids:        newIdentities(),
+		overBackup: map[string]struct{}{},
 		marks:      map[string]uint64{},
 		pending:    map[string]*heldFile{},
 		compiled:   map[string]int{},
@@ -119,6 +124,31 @@ const (
 	// never sees.
 	inTheOverlay
 )
+
+// peekAt answers the entry at projectionPath and when it last changed, as
+// far as the daemon recorded, without recording what it sees: for a reply
+// the kernel takes a time from without checking it against the last.
+func (fsys *fileSystem) peekAt(projectionPath string) (protocol.Entry, time.Time, syscall.Errno) {
+	entry, errno := fsys.entryFor(projectionPath)
+	if errno != 0 {
+		return protocol.Entry{}, time.Time{}, errno
+	}
+	if entry.Kind == protocol.Directory {
+		return entry, fsys.recordedDirectoryTime(projectionPath), 0
+	}
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	modified := fsys.started
+	if changed, ok := fsys.changed[projectionPath]; ok && changed.After(modified) {
+		modified = changed
+	}
+	if entry.Modified > 0 {
+		if reported := time.UnixMilli(entry.Modified); reported.After(modified) {
+			modified = reported
+		}
+	}
+	return entry, modified, 0
+}
 
 // statAt answers the entry at projectionPath and when it last changed. It
 // asks the image again when a stat that overlapped this one saw the file
@@ -242,6 +272,7 @@ func (fsys *fileSystem) commitHeld(projectionPath string) error {
 	}
 	fsys.contentsChangedLocked(projectionPath)
 	fsys.compiled[projectionPath] = len(contents)
+	delete(fsys.overBackup, projectionPath)
 	return nil
 }
 
@@ -379,6 +410,39 @@ func (fsys *fileSystem) recordedDirectoryTime(projectionPath string) time.Time {
 		return known.changed
 	}
 	return fsys.started
+}
+
+// noteCreateOverBackup records, before a create takes projectionPath,
+// whether it takes the name from a class an editor's backup rename hid. The
+// caller holds changing.
+func (fsys *fileSystem) noteCreateOverBackup(projectionPath string) {
+	if isProjectedTonelFilePath(projectionPath) && fsys.overlay.IsHidden(projectionPath) {
+		fsys.overBackup[projectionPath] = struct{}{}
+		return
+	}
+	delete(fsys.overBackup, projectionPath)
+}
+
+// unlinkFile removes the file at projectionPath. When a create took the name
+// from a class an editor's backup rename hid, and no compile there
+// succeeded, it hides that class again instead of removing it from the
+// image: an editor restoring its backup after a refused save, as vim does,
+// removes the name first, then renames the backup over it, which compiles
+// over the class. The caller holds changing.
+func (fsys *fileSystem) unlinkFile(projectionPath string) syscall.Errno {
+	if _, ok := fsys.overBackup[projectionPath]; ok {
+		delete(fsys.overBackup, projectionPath)
+		fsys.overlay.Hide(projectionPath)
+		return 0
+	}
+	return fsys.unlink(projectionPath)
+}
+
+// renamedOver records that a rename took newPath, and left oldPath. The
+// caller holds changing.
+func (fsys *fileSystem) renamedOver(oldPath string, newPath string) {
+	delete(fsys.overBackup, oldPath)
+	delete(fsys.overBackup, newPath)
 }
 
 // showHiddenClass shows the class at projectionPath again when what was to

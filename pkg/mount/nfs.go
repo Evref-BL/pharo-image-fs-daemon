@@ -120,6 +120,7 @@ func (fsys *nfsFileSystem) Create(name string) (billy.File, error) {
 		return fsys.newFile(name, projectionPath, overlayFile), nil
 	}
 
+	fsys.noteCreateOverBackup(projectionPath)
 	if _, errno := fsys.createFile(projectionPath); errno != 0 {
 		return nil, pathError("create", projectionPath, errno)
 	}
@@ -202,9 +203,6 @@ func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 		fsys.showHiddenClass(newPath)
 		return err
 	}
-	fsys.mu.Lock()
-	delete(fsys.pending, newPath)
-	fsys.mu.Unlock()
 
 	var errno syscall.Errno
 	if isProjectedTonelFilePath(oldPath) && isSillyRenameName(path.Base(newPath)) {
@@ -218,6 +216,11 @@ func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 		fsys.showHiddenClass(newPath)
 		return pathError("rename", newPath, errno)
 	}
+	// What was held for the file the rename replaced goes with it.
+	fsys.mu.Lock()
+	delete(fsys.pending, newPath)
+	fsys.mu.Unlock()
+	fsys.renamedOver(oldPath, newPath)
 	fsys.ids.renamed(oldPath, newPath)
 	if original, ok := fsys.silly[oldPath]; ok {
 		delete(fsys.silly, oldPath)
@@ -303,7 +306,7 @@ func (fsys *nfsFileSystem) Remove(name string) error {
 	if entry.Kind == protocol.Directory {
 		errno = fsys.rmdir(projectionPath)
 	} else {
-		errno = fsys.unlink(projectionPath)
+		errno = fsys.unlinkFile(projectionPath)
 	}
 	fsys.namespaceChanged(projectionPath)
 	if errno != 0 {

@@ -3,12 +3,15 @@
 package mount
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"log"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -328,15 +331,17 @@ func TestFUSESaveCompilesAtClose(t *testing.T) {
 	if contents := k.readFile(objectPath); contents != "new source" {
 		t.Fatalf("held writes should read as written, read %q", contents)
 	}
+	beforeClose := k.notices.droppedAttributesOf(file.node)
 	if status := k.close(file, writer); status != fuse.OK {
 		t.Fatalf("close: %v", status)
 	}
 	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=new source"}) {
 		t.Fatalf("the close should compile once, got %v", writes)
 	}
-	if k.notices.droppedAttributesOf(file.node) == 0 {
+	if k.notices.droppedAttributesOf(file.node) == beforeClose {
 		t.Fatalf("a compile should drop the attributes the kernel has for the file")
 	}
+	_ = k.notices.droppedAttributesOf(file.node)
 	k.release(file)
 	if writes := client.writes(); len(writes) != 1 {
 		t.Fatalf("the release should compile nothing more, got %v", writes)
@@ -384,11 +389,16 @@ func TestFUSEReadOnlyOpenNeverCompiles(t *testing.T) {
 }
 
 func TestFUSEAChildsCloseCompilesNothing(t *testing.T) {
-	// { cat a && cat b; } > Object.class.st: the shell opens, its children
-	// write and close their copies, the shell closes last.
-	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	// { printf a; cat b; } > Object.class.st: the shell opens the file,
+	// moves the descriptor to its output and closes the first one, before
+	// anything is written; its children write and close their copies; the
+	// shell restores its output last.
+	client := &emptyRefusingClient{newMemoryClient(map[string]string{objectPath: "an older and longer source"})}
 	k := newTestKernel(t, client)
 	file := k.mustOpen(objectPath, openWriteOnly|openTruncate, writer)
+	if status := k.close(file, writer); status != fuse.OK {
+		t.Fatalf("closing the descriptor a shell moved should not fail, got %v", status)
+	}
 	k.mustWrite(file, 0, "first half, ")
 	if status := k.close(file, child); status != fuse.OK {
 		t.Fatalf("a child's close should not fail, got %v", status)
@@ -419,7 +429,7 @@ func TestFUSEWhatNoCloseCompiledCompilesAtRelease(t *testing.T) {
 }
 
 func TestFUSEAWriterGoesOnFromWhatItsLastCompileTook(t *testing.T) {
-	client := &renderingClient{newMemoryClient(map[string]string{objectPath: "old source"})}
+	client := &prefixingClient{newMemoryClient(map[string]string{objectPath: "old source"})}
 	k := newTestKernel(t, client)
 	file := k.mustOpen(objectPath, openReadWrite|openTruncate, writer)
 	k.mustWrite(file, 0, "first, ")
@@ -429,8 +439,22 @@ func TestFUSEAWriterGoesOnFromWhatItsLastCompileTook(t *testing.T) {
 	k.mustWrite(file, uint64(len("first, ")), "second")
 	k.close(file, writer)
 	k.release(file)
-	if contents := client.contents(objectPath); !strings.HasPrefix(contents, "first, second") {
+	if contents := client.contents(objectPath); contents != "\"rendered\"\nfirst, second" {
 		t.Fatalf("the writer's later writes should go on from its own text, not the image's rendering, image has %q", contents)
+	}
+
+	// Once another process saved the file, a writer goes on from that.
+	file = k.mustOpen(objectPath, openReadWrite|openTruncate, writer)
+	k.mustWrite(file, 0, "mine, ")
+	k.fsync(file)
+	if status := k.save(objectPath, "theirs"); status != fuse.OK {
+		t.Fatalf("save: %v", status)
+	}
+	k.mustWrite(file, uint64(len("\"rendered\"\ntheirs")), "!")
+	k.close(file, writer)
+	k.release(file)
+	if contents := client.contents(objectPath); contents != "\"rendered\"\n\"rendered\"\ntheirs!" {
+		t.Fatalf("a writer should not revert another process's save, image has %q", contents)
 	}
 }
 
@@ -747,5 +771,478 @@ func TestFUSEMountOptions(t *testing.T) {
 	}
 	if status := options.PanicHandler("boom"); status != fuse.EIO {
 		t.Fatalf("a panic should answer EIO, got %v", status)
+	}
+}
+
+// emptyRefusingClient refuses to compile an empty class file, as the image
+// does.
+type emptyRefusingClient struct {
+	*memoryClient
+}
+
+func (c *emptyRefusingClient) Write(ctx context.Context, filePath string, contents []byte) (protocol.WriteResult, error) {
+	if len(contents) == 0 {
+		return protocol.WriteResult{}, &protocol.Error{StatusCode: http.StatusBadRequest, Message: "Expected exactly one class definition, got 0"}
+	}
+	return c.memoryClient.Write(ctx, filePath, contents)
+}
+
+// prefixingClient compiles what it is given and renders it with a comment
+// first, as an image that renders a file its own way does.
+type prefixingClient struct {
+	*memoryClient
+}
+
+func (c *prefixingClient) Write(ctx context.Context, filePath string, contents []byte) (protocol.WriteResult, error) {
+	return c.memoryClient.Write(ctx, filePath, append([]byte("\"rendered\"\n"), contents...))
+}
+
+// listingCountingClient counts the listings the image is asked for.
+type listingCountingClient struct {
+	*memoryClient
+	listings atomic.Int64
+}
+
+func (c *listingCountingClient) List(ctx context.Context, directory string) ([]protocol.Entry, error) {
+	c.listings.Add(1)
+	return c.memoryClient.List(ctx, directory)
+}
+
+func TestFUSEAShellRedirectionCompilesOnce(t *testing.T) {
+	// cat > Object.class.st <<EOF: the shell opens truncating, moves the
+	// descriptor and closes the first one, then cat writes and closes.
+	client := &emptyRefusingClient{newMemoryClient(map[string]string{objectPath: "an older and much longer source"})}
+	k := newTestKernel(t, client)
+	file := k.mustOpen(objectPath, openWriteOnly|openTruncate, writer)
+	if status := k.close(file, writer); status != fuse.OK {
+		t.Fatalf("closing the moved descriptor should not fail, got %v", status)
+	}
+	k.mustWrite(file, 0, "new source")
+	if status := k.close(file, writer); status != fuse.OK {
+		t.Fatalf("close: %v", status)
+	}
+	k.release(file)
+	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=new source"}) {
+		t.Fatalf("the save should compile once, with nothing of the old text, got %v", writes)
+	}
+
+	// : > Object.class.st empties the file, which compiles once it is closed
+	// for good.
+	file = k.mustOpen(objectPath, openWriteOnly|openTruncate, writer)
+	k.close(file, writer)
+	if writes := client.writes(); len(writes) != 1 {
+		t.Fatalf("a truncation alone should not compile at a close, got %v", writes)
+	}
+	k.release(file)
+	if latest := k.readFile("/errors/latest.txt"); !strings.Contains(latest, "Expected exactly one class definition") {
+		t.Fatalf("emptying the file should compile at its release, /errors has %q", latest)
+	}
+}
+
+func TestFUSEAWriteAfterAnEmptyCompileGoesOnFromEmpty(t *testing.T) {
+	client := &emptyRefusingClient{newMemoryClient(map[string]string{objectPath: "an older and much longer source"})}
+	k := newTestKernel(t, client)
+	file := k.mustOpen(objectPath, openWriteOnly|openTruncate, writer)
+	if status := k.fsync(file); status != fuse.EIO {
+		t.Fatalf("fsync should report the image's refusal of an empty class, got %v", status)
+	}
+	k.mustWrite(file, 0, "new source")
+	k.close(file, writer)
+	k.release(file)
+	if contents := client.contents(objectPath); contents != "new source" {
+		t.Fatalf("writes after a compile of an empty file should go on from empty, image has %q", contents)
+	}
+}
+
+func TestFUSEARefusedRenameKeepsTheTargetsWriter(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	k := newTestKernel(t, client)
+	target := k.mustOpen(objectPath, openWriteOnly|openTruncate, writer)
+	k.mustWrite(target, 0, "the writer's source")
+	temp := "/tonel/Kernel/sedAb12Cd"
+	file := k.mustCreate(temp, openWriteOnly, child)
+	k.mustWrite(file, 0, "syntax error")
+	k.close(file, child)
+	k.release(file)
+	if status := k.rename(temp, objectPath, 0); status != fuse.EIO {
+		t.Fatalf("the refused rename should fail, got %v", status)
+	}
+	if status := k.close(target, writer); status != fuse.OK {
+		t.Fatalf("close: %v", status)
+	}
+	k.release(target)
+	if contents := client.contents(objectPath); contents != "the writer's source" {
+		t.Fatalf("a refused rename should keep the target's held writes, image has %q", contents)
+	}
+}
+
+func TestVimsRestoreAfterARefusedSaveKeepsTheClass(t *testing.T) {
+	// vim renames the file to its backup, writes a new one, and when the
+	// image refuses it, removes the name and renames the backup back.
+	t.Run("FUSE", func(t *testing.T) {
+		client := newMemoryClient(map[string]string{objectPath: "old source"})
+		k := newTestKernel(t, client)
+		k.rename(objectPath, objectPath+"~", 0)
+		file := k.mustCreate(objectPath, openWriteOnly|openTruncate, writer)
+		k.mustWrite(file, 0, "syntax error")
+		if status := k.fsync(file); status != fuse.EIO {
+			t.Fatalf("fsync should report the refusal, got %v", status)
+		}
+		k.close(file, writer)
+		k.release(file)
+		if status := k.unlink(objectPath); status != fuse.OK {
+			t.Fatalf("unlink: %v", status)
+		}
+		if status := k.rename(objectPath+"~", objectPath, 0); status != fuse.OK {
+			t.Fatalf("restore: %v", status)
+		}
+		if deletes := client.deletes(); len(deletes) != 0 {
+			t.Fatalf("restoring the backup should not remove the class, the image deleted %v", deletes)
+		}
+		if contents := client.contents(objectPath); contents != "old source" {
+			t.Fatalf("the image has %q", contents)
+		}
+
+		// After a save over a backup that compiled, removing the name
+		// removes the class.
+		k.rename(objectPath, objectPath+"~", 0)
+		file = k.mustCreate(objectPath, openWriteOnly|openTruncate, writer)
+		k.mustWrite(file, 0, "new source")
+		k.close(file, writer)
+		k.release(file)
+		k.unlink(objectPath)
+		if deletes := client.deletes(); !slices.Equal(deletes, []string{objectPath}) {
+			t.Fatalf("removing a saved class should remove it from the image, deleted %v", deletes)
+		}
+	})
+	t.Run("NFS", func(t *testing.T) {
+		client := newMemoryClient(map[string]string{objectPath: "old source"})
+		fsys := newNFSFileSystem(client)
+		if err := fsys.Rename(objectPath, objectPath+"~"); err != nil {
+			t.Fatalf("backup: %v", err)
+		}
+		if _, err := fsys.Create(objectPath); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if _, err := writeAsNFS(t, fsys, objectPath, "syntax error", 0); err == nil {
+			t.Fatalf("the image should refuse the save")
+		}
+		if err := fsys.Remove(objectPath); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if err := fsys.Rename(objectPath+"~", objectPath); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		if deletes := client.deletes(); len(deletes) != 0 {
+			t.Fatalf("restoring the backup should not remove the class, the image deleted %v", deletes)
+		}
+		if contents := client.contents(objectPath); contents != "old source" {
+			t.Fatalf("the image has %q", contents)
+		}
+
+		// After a save over a backup that compiled, removing the name
+		// removes the class.
+		if err := fsys.Rename(objectPath, objectPath+"~"); err != nil {
+			t.Fatalf("backup: %v", err)
+		}
+		if _, err := fsys.Create(objectPath); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if _, err := writeAsNFS(t, fsys, objectPath, "new source", 0); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if err := fsys.Remove(objectPath); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if deletes := client.deletes(); !slices.Equal(deletes, []string{objectPath}) {
+			t.Fatalf("removing a saved class should remove it from the image, deleted %v", deletes)
+		}
+	})
+}
+
+func TestNFSARefusedRenameKeepsTheTargetsHeldWrites(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	truncateAsNFS(t, fsys, objectPath, 0)
+	if committed, err := writeAsNFS(t, fsys, objectPath, strings.Repeat("a", pageSize), 0); committed || err != nil {
+		t.Fatalf("a page should be held, got %v %v", committed, err)
+	}
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := writeNFS(fsys, temp, "syntax error", 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := fsys.Rename(temp, objectPath); err == nil {
+		t.Fatalf("the image should refuse the rename")
+	}
+	if err := fsys.Commit(objectPath); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if contents := client.contents(objectPath); contents != strings.Repeat("a", pageSize) {
+		t.Fatalf("a refused rename should keep the target's held writes, image has %q", contents[:min(len(contents), 16)])
+	}
+}
+
+func TestFUSEOpeningAClassTheImageRemovedIsStale(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "source", "/tonel/Kernel/Other.class.st": "other"})
+	k := newTestKernel(t, client)
+	node := k.node(objectPath)
+	_ = client.Delete(context.Background(), objectPath)
+	// The kernel still trusts the name, and opens its node to save over it.
+	in := fuse.OpenIn{InHeader: header(node, writer), Flags: openWriteOnly | openTruncate}
+	var out fuse.OpenOut
+	if status := k.raw.Open(nil, &in, &out); status != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("opening a class the image removed should be stale, so the kernel creates it again, got %v", status)
+	}
+}
+
+func TestFUSEACreatedFileThatLeftIsStale(t *testing.T) {
+	created := "/tonel/Kernel/New.class.st"
+	for name, leave := range map[string]func(*testKernel, openedFile){
+		"refused": func(k *testKernel, file openedFile) {
+			k.mustWrite(file, 0, "syntax error")
+			k.close(file, writer)
+		},
+		"unwritten": func(k *testKernel, file openedFile) {
+			k.close(file, writer)
+		},
+	} {
+		k := newTestKernel(t, newMemoryClient(map[string]string{objectPath: "source"}))
+		file := k.mustCreate(created, openWriteOnly, writer)
+		leave(k, file)
+		k.release(file)
+		// The kernel still trusts the name, and opens its node.
+		for _, flags := range []uint32{openWriteOnly | openTruncate, openReadOnly} {
+			in := fuse.OpenIn{InHeader: header(file.node, writer), Flags: flags}
+			var out fuse.OpenOut
+			if status := k.raw.Open(nil, &in, &out); status != fuse.Status(syscall.ESTALE) {
+				t.Fatalf("%s: opening a created file that left should be stale, so the kernel looks the name up again, got %v", name, status)
+			}
+		}
+	}
+}
+
+func TestFUSEOpenDescriptorsGoOnThroughARemoval(t *testing.T) {
+	client := newGatedClient(map[string]string{objectPath: "old source", "/tonel/Kernel/Other.class.st": "other"})
+	k := newTestKernel(t, client)
+	reader := k.mustOpen(objectPath, openReadOnly, writer)
+	node := reader.node
+
+	started, open := client.holdNext("delete")
+	defer open()
+	removed := make(chan fuse.Status, 1)
+	go func() { removed <- k.unlink(objectPath) }()
+	waitHeld(t, started)
+	read := make(chan string, 1)
+	go func() {
+		contents, _ := k.read(reader)
+		read <- contents
+	}()
+	stat := make(chan fuse.Status, 1)
+	go func() {
+		_, status := k.getattr(node)
+		stat <- status
+	}()
+	opened := make(chan fuse.Status, 1)
+	go func() {
+		in := fuse.OpenIn{InHeader: header(node, writer), Flags: openReadOnly}
+		var out fuse.OpenOut
+		opened <- k.raw.Open(nil, &in, &out)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	open()
+	if status := within(t, removed, "unlink"); status != fuse.OK {
+		t.Fatalf("unlink: %v", status)
+	}
+	if contents := within(t, read, "read"); contents != "old source" {
+		t.Fatalf("a read of an open descriptor overlapping its removal should answer what it had, got %q", contents)
+	}
+	if status := within(t, stat, "stat"); status != fuse.OK {
+		t.Fatalf("a stat of an open descriptor overlapping its removal should answer its copy, got %v", status)
+	}
+	// As on a disk, an open that raced the removal has the file too.
+	if status := within(t, opened, "open"); status != fuse.OK {
+		t.Fatalf("an open racing the removal of an open file should have its copy, got %v", status)
+	}
+
+	// A file no one had open is gone for an open that raced its removal.
+	lone := "/tonel/Kernel/Lone.class.st"
+	client.put(lone, "lone")
+	loneNode := k.node(lone)
+	started, open = client.holdNext("delete")
+	go func() { removed <- k.unlink(lone) }()
+	waitHeld(t, started)
+	go func() {
+		in := fuse.OpenIn{InHeader: header(loneNode, writer), Flags: openReadOnly}
+		var out fuse.OpenOut
+		opened <- k.raw.Open(nil, &in, &out)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	open()
+	within(t, removed, "unlink")
+	if status := within(t, opened, "open"); status != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("an open racing the removal of a file no one had open should be stale, so the kernel looks the name up again, got %v", status)
+	}
+
+	// Its writes and sizes change only its copy.
+	writable := k.mustOpen("/tonel/Kernel/Other.class.st", openReadWrite, writer)
+	k.unlink("/tonel/Kernel/Other.class.st")
+	k.mustWrite(writable, 0, "OTHER")
+	if status := k.setSize(writable.node, &writable, 3); status != fuse.OK {
+		t.Fatalf("ftruncate: %v", status)
+	}
+	if contents, _ := k.read(writable); contents != "OTH" {
+		t.Fatalf("a removed file's writes and sizes should change its copy, read %q", contents)
+	}
+	k.close(writable, writer)
+	k.release(writable)
+	if writes := client.writes(); len(writes) != 0 {
+		t.Fatalf("a removed file compiles nothing, got %v", writes)
+	}
+}
+
+func TestFUSEASetattrNeverAnswersAChangeFirst(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "version one"})
+	k := newTestKernel(t, client)
+	node := k.node(objectPath)
+	k.getattr(node)
+	// The image changes the file; then touch -c sets its times.
+	client.put(objectPath, "version two, longer")
+	in := fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: header(node, writer), Valid: fuse.FATTR_MTIME | fuse.FATTR_MTIME_NOW}}
+	var reply fuse.AttrOut
+	if status := k.raw.SetAttr(nil, &in, &reply); status != fuse.OK {
+		t.Fatalf("setattr: %v", status)
+	}
+	next, _ := k.getattr(node)
+	if next.Mtime == reply.Mtime && next.Mtimensec == reply.Mtimensec {
+		t.Fatalf("the GETATTR after a SETATTR should answer the change, so the kernel drops its pages")
+	}
+
+	// A size set alone compiles; the next GETATTR's time moves past the reply's.
+	in = fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: header(node, writer), Valid: fuse.FATTR_SIZE, Size: 7}}
+	if status := k.raw.SetAttr(nil, &in, &reply); status != fuse.OK {
+		t.Fatalf("truncate: %v", status)
+	}
+	next, _ = k.getattr(node)
+	if next.Mtime == reply.Mtime && next.Mtimensec == reply.Mtimensec {
+		t.Fatalf("the GETATTR after a compiling SETATTR should answer a later time")
+	}
+}
+
+func TestFUSESyncedWritesCompileOnce(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	k := newTestKernel(t, client)
+	file := k.mustOpen(objectPath, openWriteOnly|openTruncate|0o10000, writer)
+	for offset, part := range []string{"new ", "source"} {
+		k.mustWrite(file, uint64(offset*len("new ")), part)
+		if status := k.fsync(file); status != fuse.OK {
+			t.Fatalf("fsync: %v", status)
+		}
+	}
+	k.close(file, writer)
+	k.release(file)
+	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=new source"}) {
+		t.Fatalf("a file opened to sync its writes should compile once, got %v", writes)
+	}
+}
+
+func TestFUSEAnEditorsFileNeverHoldsWrites(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	k := newTestKernel(t, client)
+	temp := "/tonel/Kernel/sedAb12Cd"
+	editor := k.mustCreate(temp, openWriteOnly, child)
+	k.mustWrite(editor, 0, "the temp's source")
+	k.close(editor, child)
+	if status := k.rename(temp, objectPath, 0); status != fuse.OK {
+		t.Fatalf("rename: %v", status)
+	}
+	other := k.mustOpen(objectPath, openWriteOnly|openTruncate, writer)
+	k.mustWrite(other, 0, "half of a")
+	// The editor's late RELEASE, now that its file is the class.
+	k.release(editor)
+	if writes := client.writes(); len(writes) != 1 {
+		t.Fatalf("an editor's file should compile nothing at its release, got %v", writes)
+	}
+	k.mustWrite(other, uint64(len("half of a")), " save")
+	k.close(other, writer)
+	k.release(other)
+	if contents := client.contents(objectPath); contents != "half of a save" {
+		t.Fatalf("the image has %q", contents)
+	}
+}
+
+func TestFUSEAnFsyncCompilesWhoeverAsks(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	k := newTestKernel(t, client)
+	file := k.mustOpen(objectPath, openWriteOnly|openTruncate, writer)
+	k.mustWrite(file, 0, "new source")
+	in := fuse.FsyncIn{InHeader: header(file.node, child), Fh: file.fh}
+	if status := k.raw.Fsync(nil, &in); status != fuse.OK {
+		t.Fatalf("fsync: %v", status)
+	}
+	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=new source"}) {
+		t.Fatalf("an fsync from any process should compile, got %v", writes)
+	}
+	k.close(file, writer)
+	k.release(file)
+}
+
+func TestFUSESizesThroughAFileWithNothingHeld(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	k := newTestKernel(t, client)
+	file := k.mustOpen(objectPath, openWriteOnly, writer)
+	if status := k.setSize(file.node, &file, 3); status != fuse.OK {
+		t.Fatalf("ftruncate: %v", status)
+	}
+	if writes := client.writes(); len(writes) != 0 {
+		t.Fatalf("a size set through a file is its write, which compiles at its close, got %v", writes)
+	}
+	k.close(file, writer)
+	k.release(file)
+	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=old"}) {
+		t.Fatalf("the close should compile the file cut, got %v", writes)
+	}
+}
+
+func TestFUSERenameCompilesTheSourcesHeldWritesFirst(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	k := newTestKernel(t, client)
+	moved := "/tonel/Kernel/Moved.class.st"
+	file := k.mustOpen(objectPath, openWriteOnly|openTruncate, writer)
+	k.mustWrite(file, 0, "held source")
+	if status := k.rename(objectPath, moved, 0); status != fuse.OK {
+		t.Fatalf("rename: %v", status)
+	}
+	if writes := client.writes(); len(writes) == 0 || writes[0] != objectPath+"=held source" {
+		t.Fatalf("a rename should compile the source's held writes first, got %v", writes)
+	}
+	// The file's node follows it: its next writes land at its new name.
+	k.mustWrite(file, 0, "moved source")
+	k.close(file, writer)
+	k.release(file)
+	if contents := client.contents(moved); contents != "moved source" {
+		t.Fatalf("writes through a renamed file's node should reach its new name, image has %q at %s", contents, moved)
+	}
+}
+
+func TestFUSEDirectoriesDoNotListThemselvesOnAStat(t *testing.T) {
+	client := &listingCountingClient{memoryClient: newMemoryClient(map[string]string{objectPath: "source"})}
+	k := newTestKernel(t, client)
+	node := k.node("/tonel/Kernel")
+	before := client.listings.Load()
+	for range 3 {
+		// Once the last listing is older than a listing is trusted for.
+		k.fsys.mu.Lock()
+		for directory, known := range k.fsys.listings {
+			known.checked = time.Time{}
+			k.fsys.listings[directory] = known
+		}
+		k.fsys.mu.Unlock()
+		k.getattr(node)
+	}
+	if client.listings.Load() != before {
+		t.Fatalf("a stat of a directory should not list it")
 	}
 }

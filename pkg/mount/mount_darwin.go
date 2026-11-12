@@ -30,6 +30,11 @@ func Mount(mountPoint string, client protocol.Client, config Config) error {
 	if err != nil {
 		return err
 	}
+	// From now on, so that a signal while mounting unmounts once mounted
+	// rather than ending the daemon with its mount left behind.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, stopSignals()...)
+	defer signal.Stop(signals)
 
 	logger := log.New(os.Stderr, "pharo-image-fs: ", log.LstdFlags)
 	server, err := startNFSServer(client, logger)
@@ -51,8 +56,6 @@ func Mount(mountPoint string, client protocol.Client, config Config) error {
 		return fmt.Errorf("mount_nfs succeeded, but nothing is mounted at %s", mountPoint)
 	}
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, stopSignals()...)
 	gone := make(chan struct{})
 	stopWatching := watchImage(client, logger, func() { close(gone) })
 	defer stopWatching()
