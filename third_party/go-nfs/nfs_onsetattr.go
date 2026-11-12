@@ -1,7 +1,8 @@
 package nfs
 
-// Changed for pharo-image-fs: an error from the file system keeps its errno's
-// meaning (see pifs.go), STALE included.
+// Changed for pharo-image-fs: a SETATTR that may commit a Committer's file
+// sends no pre-op attributes, and an error from the file system keeps its
+// errno's meaning (see pifs.go), STALE included.
 
 import (
 	"bytes"
@@ -67,6 +68,9 @@ func onSetAttr(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	preAttr := ToFileAttribute(info, fullPath).AsCache()
+	if mayCommit(fs, attrs) {
+		preAttr = nil
+	}
 
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {

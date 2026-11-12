@@ -7,6 +7,11 @@ package nfs
 //   - A file system implementing Committer can hold writes until they make a
 //     whole file, and commit them then: a client does not tell the writer
 //     that a COMMIT failed, but it does tell it that a write failed.
+//   - A WRITE or SETATTR that may have committed a file sends no pre-op
+//     attributes: the file then holds what the file system made of the
+//     client's bytes, and a client that finds its own cached attributes in the
+//     pre-op ones takes the post-op ones for its own change and keeps its
+//     pages.
 //   - ACCESS no longer grants modification of an object whose mode has no
 //     owner write bit.
 //   - Errors carrying a syscall.Errno keep their meaning (EROFS, ENOENT,
@@ -24,11 +29,18 @@ import (
 type Committer interface {
 	// Written is called after each write to the file at path, stable when the
 	// client asked for it to be durable. It answers whether the writes held
-	// for the file are committed now, or why they are refused, which fails
-	// the write.
-	Written(path string, stable bool) (committed bool, err error)
+	// for the file are committed now, whether this write committed them, or
+	// why they are refused, which fails the write.
+	Written(path string, stable bool) (committed bool, committedNow bool, err error)
 	// Commit commits the writes still held for the file at path.
 	Commit(path string) error
+}
+
+// mayCommit answers whether setting a file's attributes to attrs may commit
+// it: setting a size other than 0, which no write may follow.
+func mayCommit(fs any, attrs *SetFileAttributes) bool {
+	_, ok := fs.(Committer)
+	return ok && attrs.SetSize != nil && *attrs.SetSize != 0
 }
 
 func statusFromError(err error, fallback NFSStatus) NFSStatus {

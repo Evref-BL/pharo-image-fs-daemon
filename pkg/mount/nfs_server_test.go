@@ -24,6 +24,7 @@ const (
 	nfsVersion = 3
 
 	procGetattr = 1
+	procSetattr = 2
 	procLookup  = 3
 	procRead    = 6
 	procWrite   = 7
@@ -45,6 +46,7 @@ const (
 	statusStale   = 70
 	statusNotSupp = 10004
 
+	unstable = 0
 	fileSync = 2
 )
 
@@ -280,11 +282,21 @@ func TestNFSServerEndsAConnectionWhoseRepliesCannotBeSent(t *testing.T) {
 		read.u32(256 << 10)
 		peer.send(t, procRead, read)
 	}
-	time.Sleep(300 * time.Millisecond)
+	// Every call the connection serves at once waits to queue its reply, so
+	// the connection reads no more calls: only the failed send can end it.
+	full := time.Now().Add(10 * time.Second)
+	for repliesWaitingToQueue() < concurrentCalls {
+		if time.Now().After(full) {
+			t.Fatalf("every call served should wait to queue its reply, %d do", repliesWaitingToQueue())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	_ = conn.(*net.TCPConn).SetLinger(0)
 	_ = conn.Close()
 
-	deadline := time.Now().Add(5 * time.Second)
+	// The send blocked on the full window may only fail at the system's next
+	// probe of it, seconds later; a connection that leaks never ends.
+	deadline := time.Now().Add(30 * time.Second)
 	for runtime.NumGoroutine() > before {
 		if time.Now().After(deadline) {
 			t.Fatalf("the connection's goroutines outlived it: %d running, %d before", runtime.NumGoroutine(), before)
@@ -311,8 +323,8 @@ func TestNFSServerAcceptsTheWritesItAdvertises(t *testing.T) {
 		at += 84
 	}
 	wtmax := binary.BigEndian.Uint32(reply.body[at+12:])
-	if wtmax == 0 || wtmax > 16<<20-4096 {
-		t.Fatalf("FSINFO should advertise writes the framing accepts, got %d", wtmax)
+	if wtmax != 64<<10 {
+		t.Fatalf("FSINFO should advertise writes of 64 KiB, which bound what a full queue of calls holds, got %d", wtmax)
 	}
 	write := server.call(t, procWrite, func() *xdrBuffer {
 		args := &xdrBuffer{}
@@ -616,5 +628,113 @@ func TestNFSServerReadsAnswerDataAsNewAsTheirAttributes(t *testing.T) {
 	count = binary.BigEndian.Uint32(reply.body[92:])
 	if data := string(reply.body[104 : 104+int(count)]); data != "version 3, longer!!" {
 		t.Fatalf("a read after a same-size change in the image should answer the new data, got %q", data)
+	}
+
+	// The image changes while the READ renders the file: its attributes,
+	// taken first, must not be newer than its data.
+	gated := newGatedClient(map[string]string{objectPath: "version one"})
+	server = startTestServer(t, gated)
+	started, open := gated.holdNext("read")
+	defer open()
+	args := &xdrBuffer{}
+	args.opaque(server.handle(objectPath))
+	args.u64(0)
+	args.u32(4096)
+	xid := server.send(t, procRead, args)
+	waitHeld(t, started)
+	gated.put(objectPath, "version two, longer")
+	open()
+	reply, ok := server.receive(t, 5*time.Second)
+	if !ok || reply.xid != xid || reply.status() != statusOK {
+		t.Fatalf("the READ should be answered")
+	}
+	size = binary.BigEndian.Uint64(reply.body[8+20:])
+	count = binary.BigEndian.Uint32(reply.body[92:])
+	if uint64(count) != size || string(reply.body[104:104+int(count)]) != "version one" {
+		t.Fatalf("a READ should answer the data its attributes describe, got %q for size %d", reply.body[104:104+int(count)], size)
+	}
+}
+
+// repliesWaitingToQueue answers how many calls wait to queue their reply.
+func repliesWaitingToQueue() int {
+	stacks := make([]byte, 64<<20)
+	return strings.Count(string(stacks[:runtime.Stack(stacks, true)]), "nfs.(*response).finish(")
+}
+
+// renderingClient compiles what it is given and renders it its own way, as
+// the image does.
+type renderingClient struct {
+	*memoryClient
+}
+
+func (c *renderingClient) Write(ctx context.Context, filePath string, contents []byte) (protocol.WriteResult, error) {
+	return c.memoryClient.Write(ctx, filePath, append(append([]byte(nil), contents...), "\n\"rendered\"\n"...))
+}
+
+func (s *testServer) setSize(t *testing.T, projectionPath string, size uint64) rpcReply {
+	t.Helper()
+	args := &xdrBuffer{}
+	args.opaque(s.handle(projectionPath))
+	args.u32(0, 0, 0, 1) // mode, uid, gid not set; size set
+	args.u64(size)
+	args.u32(0, 0, 0) // atime and mtime not set, no guard
+	return s.call(t, procSetattr, args)
+}
+
+// wcc is the wcc_data a reply's body starts with, after its status.
+type wcc struct {
+	pre      bool
+	postSize uint64
+}
+
+func wccIn(reply rpcReply) wcc {
+	at := 4
+	var data wcc
+	if binary.BigEndian.Uint32(reply.body[at:]) == 1 {
+		data.pre = true
+		at += 24
+	}
+	at += 4
+	if binary.BigEndian.Uint32(reply.body[at:]) == 1 {
+		data.postSize = binary.BigEndian.Uint64(reply.body[at+4+20:])
+	}
+	return data
+}
+
+func TestNFSServerACallThatCompilesSendsNoPreOpAttributes(t *testing.T) {
+	client := &renderingClient{newMemoryClient(map[string]string{objectPath: "old source"})}
+	server := startTestServer(t, client)
+
+	// open(O_TRUNC): the client takes the attributes as its own change.
+	if emptied := server.setSize(t, objectPath, 0); emptied.status() != statusOK || !wccIn(emptied).pre {
+		t.Fatalf("emptying a file should keep its pre-op attributes")
+	}
+	page := &xdrBuffer{}
+	page.opaque(server.handle(objectPath))
+	page.u64(0)
+	page.u32(pageSize, unstable)
+	page.opaque([]byte(strings.Repeat("a", pageSize)))
+	if held := server.call(t, procWrite, page); held.status() != statusOK || !wccIn(held).pre {
+		t.Fatalf("a held write should keep its pre-op attributes")
+	}
+
+	source := "a new source"
+	server.setSize(t, objectPath, 0)
+	server.write(t, objectPath, source)
+	compiled, ok := server.receive(t, 5*time.Second)
+	if !ok || compiled.status() != statusOK {
+		t.Fatalf("the save should compile")
+	}
+	// A client that found its own attributes in the pre-op ones would take
+	// the image's rendering for its own bytes, and keep them.
+	if data := wccIn(compiled); data.pre || data.postSize != uint64(len(client.contents(objectPath))) {
+		t.Fatalf("a write that compiles should send no pre-op attributes, and the rendering's size: %+v", data)
+	}
+
+	if cut := server.setSize(t, objectPath, 5); cut.status() != statusOK || wccIn(cut).pre {
+		t.Fatalf("a size that compiles the file should send no pre-op attributes")
+	}
+	if contents := client.contents(objectPath); !strings.HasPrefix(contents, "a new\n") {
+		t.Fatalf("the image should have the file cut to its size, has %q", contents)
 	}
 }

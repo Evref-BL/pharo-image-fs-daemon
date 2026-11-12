@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"unicode"
 
 	"github.com/Evref-BL/pharo-image-fs-daemon/pkg/protocol"
 )
@@ -375,14 +376,33 @@ func isWritableProjectionPath(projectionPath string) bool {
 	return projectionPath == "/tonel" || strings.HasPrefix(projectionPath, "/tonel/")
 }
 
+// isProjectedTonelFilePath answers whether projectionPath names a class's
+// Tonel file: a class name, then ".class.st" or ".extension.st". Other names,
+// as the temp files of editors and tools such as sed's ".!123!Foo.class.st",
+// are files of the mount's own.
 func isProjectedTonelFilePath(projectionPath string) bool {
-	if isIgnoredMetadataPath(projectionPath) {
+	if isIgnoredMetadataPath(projectionPath) || !strings.HasPrefix(projectionPath, "/tonel/") {
 		return false
 	}
 
-	return strings.HasPrefix(projectionPath, "/tonel/") &&
-		(strings.HasSuffix(path.Base(projectionPath), ".class.st") ||
-			strings.HasSuffix(path.Base(projectionPath), ".extension.st"))
+	base := path.Base(projectionPath)
+	for _, suffix := range []string{".class.st", ".extension.st"} {
+		if className, ok := strings.CutSuffix(base, suffix); ok {
+			return isClassName(className)
+		}
+	}
+	return false
+}
+
+// isClassName answers whether name may name a class: a letter, then letters,
+// digits and underscores. Whether the image takes it is the image's call.
+func isClassName(name string) bool {
+	for index, char := range name {
+		if !unicode.IsLetter(char) && (index == 0 || !unicode.IsDigit(char) && char != '_') {
+			return false
+		}
+	}
+	return name != ""
 }
 
 func isProjectedTonelPackagePath(projectionPath string) bool {

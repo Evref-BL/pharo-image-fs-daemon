@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -22,7 +23,7 @@ import (
 const objectPath = "/tonel/Kernel/Object.class.st"
 
 // writeAsNFS writes data at offset to name as go-nfs does for one WRITE
-// call, and answers what Written answered.
+// call, and answers whether Written answered it committed.
 func writeAsNFS(t *testing.T, fsys *nfsFileSystem, name string, data string, offset int64) (bool, error) {
 	t.Helper()
 	file, err := fsys.OpenFile(name, os.O_RDWR, 0)
@@ -38,7 +39,8 @@ func writeAsNFS(t *testing.T, fsys *nfsFileSystem, name string, data string, off
 	if err := file.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	return fsys.Written(name, false)
+	committed, _, err := fsys.Written(name, false)
+	return committed, err
 }
 
 func truncateAsNFS(t *testing.T, fsys *nfsFileSystem, name string, size int64) {
@@ -64,7 +66,7 @@ func writeNFS(fsys *nfsFileSystem, name string, data string, offset int64) error
 	if _, err := file.Write([]byte(data)); err != nil {
 		return err
 	}
-	_, err = fsys.Written(name, false)
+	_, _, err = fsys.Written(name, false)
 	return err
 }
 
@@ -388,11 +390,7 @@ func TestNFSDirectoryTimeMovesWhenTheImageAddsAClass(t *testing.T) {
 	}
 
 	client.put("/tonel/Kernel/Added.class.st", "added")
-	fsys.mu.Lock()
-	known := fsys.listings["/tonel/Kernel"]
-	known.checked = time.Time{}
-	fsys.listings["/tonel/Kernel"] = known
-	fsys.mu.Unlock()
+	expireListings(fsys)
 	if !modifiedAt(t, fsys, "/tonel/Kernel").After(before) {
 		t.Fatalf("a class added in the image should move its package's time")
 	}
@@ -641,6 +639,9 @@ func (c *memoryClient) Rmdir(context.Context, string) error {
 }
 
 func TestNFSConcurrentWritesToAnEditorFileLoseNothing(t *testing.T) {
+	// Writes that run one after another lose nothing whether they wait for
+	// one another or not.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(max(4, runtime.GOMAXPROCS(0))))
 	fsys := newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "old"}))
 	temp := "/tonel/Kernel/.Object.class.st.swp"
 	if _, err := fsys.Create(temp); err != nil {
@@ -667,6 +668,9 @@ func TestNFSConcurrentWritesToAnEditorFileLoseNothing(t *testing.T) {
 	group.Wait()
 
 	contents := readAsNFS(t, fsys, temp)
+	if len(contents) != pages*pageSize {
+		t.Fatalf("the file has %d bytes, %d were written", len(contents), pages*pageSize)
+	}
 	for page := range pages {
 		if contents[page*pageSize] != byte('a'+page%26) {
 			t.Fatalf("page %d was lost to another write", page)
@@ -686,7 +690,7 @@ func TestNFSHeldFileCompilesOnceWhileItsCompileRuns(t *testing.T) {
 	waitHeld(t, started)
 	second := make(chan error, 1)
 	go func() {
-		_, err := fsys.Written(objectPath, false)
+		_, _, err := fsys.Written(objectPath, false)
 		second <- err
 	}()
 	select {
@@ -735,7 +739,7 @@ func TestNFSAHandleOvertakenByARenameNamesItsFile(t *testing.T) {
 	if _, err := fsys.OpenFile(className, os.O_RDWR, 0); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("writing through the replaced file's handle should be stale, got %v", err)
 	}
-	if _, err := fsys.Written(className, false); !errors.Is(err, syscall.ESTALE) {
+	if _, _, err := fsys.Written(className, false); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("committing through the replaced file's handle should be stale, got %v", err)
 	}
 	info, err := fsys.Lstat(tempName)
@@ -1017,5 +1021,455 @@ func TestNFSAWriteFollowsItsFileToAnEditorBackup(t *testing.T) {
 	fsys.mu.Unlock()
 	if held {
 		t.Fatalf("an editor's backup should not hold writes for the image")
+	}
+}
+
+// expireListings makes the next stat of a directory list it again, as it
+// does once its last listing is a second old.
+func expireListings(fsys *nfsFileSystem) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	for directory, known := range fsys.listings {
+		known.checked = time.Time{}
+		fsys.listings[directory] = known
+	}
+}
+
+func TestNFSToolsTempFilesAreNotClassFiles(t *testing.T) {
+	for _, projected := range []string{objectPath, "/tonel/Kernel/Éclair.class.st", "/tonel/Kernel/Object_2.extension.st"} {
+		if !isProjectedTonelFilePath(projected) {
+			t.Errorf("%s should be a class's file", projected)
+		}
+	}
+	for _, other := range []string{"/tonel/Kernel/.!123!Object.class.st", "/tonel/Kernel/.Object.class.st", "/tonel/Kernel/2Object.class.st", "/tonel/Kernel/.class.st", "/tonel/Kernel/Object.class.st~"} {
+		if isProjectedTonelFilePath(other) {
+			t.Errorf("%s should be a file of the mount's own", other)
+		}
+	}
+
+	// macOS sed -i writes its output beside the file, then renames it over.
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	temp := "/tonel/Kernel/.!123!Object.class.st"
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := writeAsNFS(t, fsys, temp, "new source", 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := fsys.Rename(temp, objectPath); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if writes := client.writes(); len(writes) != 1 || writes[0] != objectPath+"=new source" {
+		t.Fatalf("sed's save should compile once, onto the class, got %v", writes)
+	}
+}
+
+func TestNFSEachRefusalHasItsOwnName(t *testing.T) {
+	other := "/tonel/Kernel/Other.class.st"
+	fsys := newNFSFileSystem(&echoRefusingClient{newMemoryClient(map[string]string{objectPath: "source", other: "other"})})
+	truncateAsNFS(t, fsys, objectPath, 0)
+	_, _ = writeAsNFS(t, fsys, objectPath, "refusal A", 0)
+	truncateAsNFS(t, fsys, other, 0)
+	_, _ = writeAsNFS(t, fsys, other, "refusal B", 0)
+
+	infos, err := fsys.ReadDir("/errors")
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	read := map[string]bool{}
+	for _, name := range namesOf(infos) {
+		if name == latestErrorName {
+			continue
+		}
+		if read[name] {
+			t.Fatalf("/errors lists %s twice", name)
+		}
+		read[name] = true
+		contents := readAsNFS(t, fsys, "/errors/"+name)
+		for _, refusal := range []string{"refusal A", "refusal B"} {
+			if strings.Contains(contents, refusal) {
+				read[refusal] = true
+			}
+		}
+	}
+	if !read["refusal A"] || !read["refusal B"] {
+		t.Fatalf("each refusal should be read under its own name, read %v", read)
+	}
+}
+
+func TestNFSARefusedNewClassLeavesItsDirectory(t *testing.T) {
+	created := "/tonel/Kernel/New.class.st"
+	fsys := newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "source"}))
+	if _, err := fsys.Create(created); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	listed, err := fsys.ReadDir("/tonel/Kernel")
+	if err != nil || !containsInfoNamed(listed, "New.class.st") {
+		t.Fatalf("a created file should be listed, got %v %v", namesOf(listed), err)
+	}
+	before := modifiedAt(t, fsys, "/tonel/Kernel")
+	if _, err := writeAsNFS(t, fsys, created, "syntax error", 0); err == nil {
+		t.Fatalf("the image should refuse the class")
+	}
+	// The client keeps the listing it has while the directory's time holds.
+	if modifiedAt(t, fsys, "/tonel/Kernel") == before {
+		t.Fatalf("a refused new class leaves its directory, whose time should move")
+	}
+}
+
+func TestNFSAListingServedMovesItsDirectorysTime(t *testing.T) {
+	added := "/tonel/Kernel/Added.class.st"
+	client := newMemoryClient(map[string]string{objectPath: "source"})
+	fsys := newNFSFileSystem(client)
+	before := modifiedAt(t, fsys, "/tonel/Kernel")
+
+	// A test adds a class and removes it in less than the second a
+	// directory's listing is trusted for, while the client lists it.
+	client.put(added, "added")
+	listed, err := fsys.ReadDir("/tonel/Kernel")
+	if err != nil || !containsInfoNamed(listed, "Added.class.st") {
+		t.Fatalf("the listing should name the added class, got %v %v", namesOf(listed), err)
+	}
+	served := modifiedAt(t, fsys, "/tonel/Kernel")
+	if served == before {
+		t.Fatalf("a listing that differs from the last should move the directory's time")
+	}
+	_ = client.Delete(context.Background(), added)
+	expireListings(fsys)
+	if modifiedAt(t, fsys, "/tonel/Kernel") == served {
+		t.Fatalf("the client would keep listing the removed class under the time it was served with")
+	}
+}
+
+func TestNFSOverlappingStatsNeverAnswerAnOlderSize(t *testing.T) {
+	client := newGatedClient(map[string]string{objectPath: "version one"})
+	fsys := newNFSFileSystem(client)
+	if size := statSize(t, fsys); size != len("version one") {
+		t.Fatalf("size %d", size)
+	}
+
+	started, open := client.holdNext("stat")
+	defer open()
+	slow := make(chan os.FileInfo, 1)
+	go func() {
+		info, _ := fsys.Lstat(objectPath)
+		slow <- info
+	}()
+	waitHeld(t, started)
+	client.put(objectPath, "version two, longer")
+	fast := modifiedAt(t, fsys, objectPath)
+	open()
+
+	// The slow stat read the image before it changed.
+	if info := within(t, slow, "stat"); info == nil || info.Size() != int64(len("version two, longer")) {
+		t.Fatalf("a stat that read the image before another stat saw it change should not answer the older size, got %v", info)
+	}
+	if size, modified := statSize(t, fsys), modifiedAt(t, fsys, objectPath); size != len("version two, longer") || modified != fast {
+		t.Fatalf("the file changed once, but answers size %d at %v after %v", size, modified, fast)
+	}
+}
+
+func statSize(t *testing.T, fsys *nfsFileSystem) int {
+	t.Helper()
+	info, err := fsys.Lstat(objectPath)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	return int(info.Size())
+}
+
+func TestNFSARefusalMovesLatestErrorsTimePastAnyStat(t *testing.T) {
+	latest := "/errors/" + latestErrorName
+	fsys := newNFSFileSystem(&echoRefusingClient{newMemoryClient(map[string]string{objectPath: "source"})})
+	// The daemon's own times run past the image's millisecond ones, as one
+	// taken in the millisecond a refusal is recorded in does.
+	fsys.clock = func() time.Time { return time.Now().Add(time.Hour) }
+	refuse := func(text string) {
+		truncateAsNFS(t, fsys, objectPath, 0)
+		_, _ = writeAsNFS(t, fsys, objectPath, text, 0)
+	}
+
+	refuse("a long first refusal")
+	modifiedAt(t, fsys, latest)
+	refuse("refusal A")
+	before := modifiedAt(t, fsys, latest)
+	refuse("refusal B")
+	if modifiedAt(t, fsys, latest) == before {
+		t.Fatalf("a refusal as long as the last should move latest.txt's time")
+	}
+}
+
+func TestNFSTimesNeverGoBackWithTheWallClock(t *testing.T) {
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+	fsys := newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "source"}))
+	behind := time.Now().Round(0).Add(-time.Minute)
+	fsys.clock = func() time.Time { return behind }
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	first := modifiedAt(t, fsys, temp)
+	if !first.After(fsys.started) {
+		t.Fatalf("a change after the wall clock stepped back should still be after the start")
+	}
+	behind = behind.Add(-time.Minute)
+	if err := writeNFS(fsys, temp, "x", 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !modifiedAt(t, fsys, temp).After(first) {
+		t.Fatalf("a change after the wall clock stepped back should still be after the last")
+	}
+}
+
+func TestNFSASizeSetAfterASaveLeavesTheFileTheImages(t *testing.T) {
+	client := &renderingClient{newMemoryClient(map[string]string{objectPath: "old source"})}
+	fsys := newNFSFileSystem(client)
+	// f.write(source); f.truncate(): the client flushes, then sets the size
+	// of what it wrote.
+	truncateAsNFS(t, fsys, objectPath, 0)
+	if _, err := writeAsNFS(t, fsys, objectPath, "new source", 0); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	truncateAsNFS(t, fsys, objectPath, int64(len("new source")))
+	// The same with a file the image renders as written.
+	truncateAsNFS(t, fsys, objectPath, int64(len(client.contents(objectPath))))
+
+	if writes := client.writes(); len(writes) != 1 {
+		t.Fatalf("the save should compile once, got %v", writes)
+	}
+	client.put(objectPath, "changed in the image")
+	if got := readAsNFS(t, fsys, objectPath); got != "changed in the image" {
+		t.Fatalf("the file should follow the image after its size was set, read %q", got)
+	}
+}
+
+func TestNFSASizeSetAloneCompilesTheFile(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	truncateAsNFS(t, fsys, objectPath, 3)
+	if writes := client.writes(); len(writes) != 1 || writes[0] != objectPath+"=old" {
+		t.Fatalf("no write follows a size set alone: it should compile the file cut, got %v", writes)
+	}
+
+	refusing := newNFSFileSystem(&echoRefusingClient{newMemoryClient(map[string]string{objectPath: "old source"})})
+	file, err := refusing.OpenFile(objectPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := file.Truncate(3); err == nil {
+		t.Fatalf("a refused size should fail")
+	}
+	if got := readAsNFS(t, refusing, objectPath); got != "old source" {
+		t.Fatalf("a refused size should leave the image's version, read %q", got)
+	}
+}
+
+func TestNFSACreateOrARefusedSaveGivesTheNameBackFromASillyRename(t *testing.T) {
+	other := "/tonel/Kernel/Other.class.st"
+	first := "/tonel/Kernel/.nfs0000000000000001"
+	second := "/tonel/Kernel/.nfs0000000000000002"
+	takeBack := map[string]func(*testing.T, *nfsFileSystem){
+		"a create": func(t *testing.T, fsys *nfsFileSystem) {
+			if _, err := fsys.Create(objectPath); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if _, err := writeAsNFS(t, fsys, objectPath, "saved source", 0); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+		},
+		"a refused rename": func(t *testing.T, fsys *nfsFileSystem) {
+			truncateAsNFS(t, fsys, other, 0)
+			_, _ = writeAsNFS(t, fsys, other, strings.Repeat("syntax error ", pageSize)[:pageSize], 0)
+			if err := fsys.Rename(other, objectPath); err == nil {
+				t.Fatalf("the rename should be refused")
+			}
+		},
+	}
+	for what, take := range takeBack {
+		client := newMemoryClient(map[string]string{objectPath: "object source", other: "other"})
+		fsys := newNFSFileSystem(client)
+		if err := fsys.Rename(objectPath, first); err != nil {
+			t.Fatalf("silly rename: %v", err)
+		}
+		take(t, fsys)
+		if err := fsys.Rename(objectPath, second); err != nil {
+			t.Fatalf("silly rename again: %v", err)
+		}
+		if err := fsys.Remove(first); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if !client.has(objectPath) {
+			t.Fatalf("after %s took the name back, closing the first .nfs file removed the class still open as the second", what)
+		}
+	}
+}
+
+func TestNFSAChangeOvertakenByARenameIsStale(t *testing.T) {
+	client := newGatedClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	handler := newNFSHandler(fsys)
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+	if _, err := fsys.Create(temp); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := writeNFS(fsys, temp, "new source", 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, components, _ := handler.FromHandle(handler.ToHandle(fsys, []string{"tonel", "Kernel", "Object.class.st"}))
+	className := path.Join(components...)
+
+	started, open := client.holdNext("write")
+	defer open()
+	renaming := make(chan error, 1)
+	go func() { renaming <- fsys.Rename(temp, objectPath) }()
+	waitHeld(t, started)
+	removing := make(chan error, 1)
+	go func() { removing <- fsys.Remove(className) }()
+	time.Sleep(100 * time.Millisecond)
+	open()
+	if err := within(t, renaming, "rename"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if err := within(t, removing, "remove"); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("a remove queued behind a rename save, through the replaced file's handle, should be stale, got %v", err)
+	}
+	if !client.has(objectPath) {
+		t.Fatalf("the remove acted on what the rename put at the old path")
+	}
+}
+
+func TestNFSCommitKeepsCallsOffItsFile(t *testing.T) {
+	client := newGatedClient(map[string]string{objectPath: "old source"})
+	fsys := newNFSFileSystem(client)
+	truncateAsNFS(t, fsys, objectPath, 0)
+	_, _ = writeAsNFS(t, fsys, objectPath, strings.Repeat("a", pageSize), 0)
+	started, open := client.holdNext("write")
+	defer open()
+	committing := make(chan error, 1)
+	go func() { committing <- fsys.Commit(objectPath) }()
+	waitHeld(t, started)
+	looked := make(chan error, 1)
+	go func() {
+		_, err := fsys.Lstat(objectPath)
+		looked <- err
+	}()
+	select {
+	case <-looked:
+		t.Fatalf("a stat of a file whose COMMIT compiles it should wait")
+	case <-time.After(100 * time.Millisecond):
+	}
+	open()
+	_ = within(t, committing, "commit")
+	_ = within(t, looked, "stat")
+}
+
+func TestNFSCreateMkdirAndRemoveLeaveTheNameAFreshId(t *testing.T) {
+	other := "/tonel/Kernel/Other.class.st"
+	client := newMemoryClient(map[string]string{objectPath: "source", other: "other", "/tonel/Kernel/Kept.class.st": "kept"})
+	fsys := newNFSFileSystem(client)
+	handler := newNFSHandler(fsys)
+
+	handle := handler.ToHandle(fsys, []string{"tonel", "Kernel", "Other.class.st"})
+	if err := fsys.Remove(other); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, _, err := handler.FromHandle(handle); err == nil {
+		t.Fatalf("a removed file's handle should be stale")
+	}
+
+	old := fsys.ids.idFor(objectPath)
+	_ = client.Delete(context.Background(), objectPath) // the image removes it on its own
+	if _, err := fsys.Create(objectPath); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if fsys.ids.idFor(objectPath) == old {
+		t.Fatalf("a created file should get a fresh id")
+	}
+
+	old = fsys.ids.idFor("/tonel/Fresh")
+	if err := fsys.MkdirAll("/tonel/Fresh", 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if fsys.ids.idFor("/tonel/Fresh") == old {
+		t.Fatalf("a made directory should get a fresh id")
+	}
+}
+
+func TestNFSATruncateFollowsItsFileToAnEditorBackup(t *testing.T) {
+	fsys := newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "old source"}))
+	backup := "/tonel/Kernel/Object.class.st~"
+	file, err := fsys.OpenFile(objectPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := fsys.Rename(objectPath, backup); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if err := file.Truncate(3); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if contents, ok := fsys.overlay.Read(backup); !ok || string(contents) != "old" {
+		t.Fatalf("the truncate should reach the backup, has %q", contents)
+	}
+	if err := file.Truncate(maxFileSize + 1); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("a size past the largest file should be refused, got %v", err)
+	}
+}
+
+func TestNFSReadsDropWhatAChangeMadeStale(t *testing.T) {
+	temp := "/tonel/Kernel/.Object.class.st.swp"
+	saves := map[string]func(*testing.T, *nfsFileSystem){
+		"a save": func(t *testing.T, fsys *nfsFileSystem) {
+			truncateAsNFS(t, fsys, objectPath, 0)
+			if committed, err := writeAsNFS(t, fsys, objectPath, "new source", 0); !committed || err != nil {
+				t.Fatalf("save: %v %v", committed, err)
+			}
+		},
+		"a rename save": func(t *testing.T, fsys *nfsFileSystem) {
+			if _, err := fsys.Create(temp); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			_, _ = writeAsNFS(t, fsys, temp, "new source", 0)
+			if err := fsys.Rename(temp, objectPath); err != nil {
+				t.Fatalf("rename: %v", err)
+			}
+		},
+	}
+	for what, save := range saves {
+		fsys := newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "old source"}))
+		before := modifiedAt(t, fsys, objectPath)
+		if got := readAsNFS(t, fsys, objectPath); got != "old source" {
+			t.Fatalf("read %q", got)
+		}
+		save(t, fsys)
+		if got := readAsNFS(t, fsys, objectPath); got != "new source" {
+			t.Fatalf("a read after %s of the same size answered %q", what, got)
+		}
+		if !modifiedAt(t, fsys, objectPath).After(before) {
+			t.Fatalf("%s should move the time", what)
+		}
+	}
+
+	// The image goes back to a size it had, within the second a read serves.
+	client := newMemoryClient(map[string]string{objectPath: "version one"})
+	fsys := newNFSFileSystem(client)
+	modifiedAt(t, fsys, objectPath)
+	readAsNFS(t, fsys, objectPath)
+	client.put(objectPath, "version two, longer")
+	modifiedAt(t, fsys, objectPath)
+	client.put(objectPath, "version 3!!")
+	modifiedAt(t, fsys, objectPath)
+	if got := readAsNFS(t, fsys, objectPath); got != "version 3!!" {
+		t.Fatalf("a read after the image changed twice should be fresh, read %q", got)
+	}
+
+	// Held writes read as written, however often they change.
+	fsys = newNFSFileSystem(newMemoryClient(map[string]string{objectPath: "old source"}))
+	truncateAsNFS(t, fsys, objectPath, 0)
+	for _, page := range []string{"a", "b"} {
+		_, _ = writeAsNFS(t, fsys, objectPath, strings.Repeat(page, pageSize), 0)
+		if got := readAsNFS(t, fsys, objectPath); got[:1] != page {
+			t.Fatalf("held writes should read as written, read %q", got[:8])
+		}
 	}
 }

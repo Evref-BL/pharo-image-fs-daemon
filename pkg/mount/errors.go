@@ -25,7 +25,7 @@ type ErrorStore struct {
 
 // errorEntry is a recorded refusal. Its time, in milliseconds, moves with each
 // one, so a client that has latest.txt cached sees the next refusal even when
-// it is as long as the last.
+// it is as long as the last, and names it apart from every other.
 type errorEntry struct {
 	name     string
 	contents []byte
@@ -40,10 +40,9 @@ func (s *ErrorStore) RecordWriteError(projectionPath string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now()
-	s.last = max(now.UnixMilli(), s.last+1)
+	s.last = max(time.Now().UnixMilli(), s.last+1)
 	entry := errorEntry{
-		name:     now.Format("2006-01-02T15-04-05") + "-write.txt",
+		name:     time.UnixMilli(s.last).Format("2006-01-02T15-04-05.000") + "-write.txt",
 		contents: []byte(writeErrorTextFor(projectionPath, err)),
 		modified: s.last,
 	}

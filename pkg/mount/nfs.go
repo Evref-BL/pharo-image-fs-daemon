@@ -55,8 +55,11 @@ const (
 type nfsFileSystem struct {
 	*projection
 
-	uid     uint32
-	gid     uint32
+	uid   uint32
+	gid   uint32
+	clock func() time.Time
+	// started is when the daemon started, on the wall clock, as every time it
+	// answers is.
 	started time.Time
 	ids     *identities
 
@@ -70,16 +73,28 @@ type nfsFileSystem struct {
 	// busy is what the running change changes, and settled is broadcast when
 	// it ends. marks holds, for each path a change changed, the number of the
 	// last change that did, and begun the number of the last change begun.
-	busy     []string
-	settled  *sync.Cond
-	marks    map[string]uint64
-	begun    uint64
-	pending  map[string]*heldFile
+	busy    []string
+	settled *sync.Cond
+	marks   map[string]uint64
+	begun   uint64
+	pending map[string]*heldFile
+	// compiled holds the length of what this mount last compiled at each
+	// path.
+	compiled map[string]int
 	changed  map[string]time.Time
-	sizes    map[string]uint64
+	// seen holds, for each file, the entry the last stat of it recorded, and
+	// stats the number of the last stat that recorded one.
+	seen     map[string]seenEntry
+	stats    uint64
 	listings map[string]listing
 	reads    map[string]cachedRead
 	last     time.Time
+}
+
+type seenEntry struct {
+	size     uint64
+	modified int64
+	stat     uint64
 }
 
 type listing struct {
@@ -96,19 +111,23 @@ type cachedRead struct {
 }
 
 func newNFSFileSystem(client protocol.Client) *nfsFileSystem {
+	started := time.Now().Round(0)
 	fsys := &nfsFileSystem{
 		projection: newProjection(client),
 		uid:        uint32(os.Getuid()),
 		gid:        uint32(os.Getgid()),
-		started:    time.Now(),
+		clock:      time.Now,
+		started:    started,
 		ids:        newIdentities(),
 		silly:      map[string]string{},
 		marks:      map[string]uint64{},
 		pending:    map[string]*heldFile{},
+		compiled:   map[string]int{},
 		changed:    map[string]time.Time{},
-		sizes:      map[string]uint64{},
+		seen:       map[string]seenEntry{},
 		listings:   map[string]listing{},
 		reads:      map[string]cachedRead{},
+		last:       started,
 	}
 	fsys.settled = sync.NewCond(&fsys.mu)
 	return fsys
@@ -470,17 +489,14 @@ func (fsys *nfsFileSystem) TempFile(dir string, _ string) (billy.File, error) {
 func (fsys *nfsFileSystem) ReadDir(name string) ([]os.FileInfo, error) {
 	var infos []os.FileInfo
 	err := fsys.observe("readdir", name, func(projectionPath string) error {
-		entries, errno := fsys.entriesIn(projectionPath)
+		entries, errno := fsys.listingFor(projectionPath)
 		if errno != 0 {
 			return pathError("readdir", projectionPath, errno)
 		}
-
+		// The time the reply carries, and the client keeps the listing under,
+		// is the one this listing records.
 		fsys.mu.Lock()
-		for pendingPath := range fsys.pending {
-			if path.Dir(pendingPath) == projectionPath && !containsEntryNamed(entries, path.Base(pendingPath)) {
-				entries = append(entries, protocol.Entry{Name: path.Base(pendingPath), Kind: protocol.File, Writable: true})
-			}
-		}
+		fsys.recordListingLocked(projectionPath, listingSignature(entries))
 		fsys.mu.Unlock()
 
 		infos = make([]os.FileInfo, 0, len(entries))
@@ -520,12 +536,19 @@ func (fsys *nfsFileSystem) MkdirAll(name string, _ os.FileMode) error {
 func (fsys *nfsFileSystem) Lstat(name string) (os.FileInfo, error) {
 	var info os.FileInfo
 	err := fsys.observe("lstat", name, func(projectionPath string) error {
-		entry, errno := fsys.entryFor(projectionPath)
-		if errno != 0 {
-			return pathError("lstat", projectionPath, errno)
+		for {
+			fsys.mu.Lock()
+			stat := fsys.stats
+			fsys.mu.Unlock()
+			entry, errno := fsys.entryFor(projectionPath)
+			if errno != 0 {
+				return pathError("lstat", projectionPath, errno)
+			}
+			if modified, ok := fsys.modificationTime(projectionPath, entry, stat); ok {
+				info = fsys.infoFor(projectionPath, entry, modified)
+				return nil
+			}
 		}
-		info = fsys.infoFor(projectionPath, entry, fsys.modificationTime(projectionPath, entry))
-		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -576,11 +599,12 @@ func (fsys *nfsFileSystem) Chtimes(string, time.Time, time.Time) error { return 
 // whole file; see nfs.Committer. A client writes whole pages, but for the
 // last one of a file: so held writes that cover the file and end inside a
 // page are a whole file, and one whose size is a multiple of the page size
-// waits for the COMMIT.
-func (fsys *nfsFileSystem) Written(name string, _ bool) (bool, error) {
+// waits for the COMMIT. A compiled file holds what the image renders, which
+// may differ from what was written.
+func (fsys *nfsFileSystem) Written(name string, _ bool) (committed bool, compiled bool, err error) {
 	paths, err := fsys.beginChange("write", name)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	defer fsys.endChange()
 	projectionPath := paths[0]
@@ -590,16 +614,16 @@ func (fsys *nfsFileSystem) Written(name string, _ bool) (bool, error) {
 	whole := ok && held.isWhole()
 	fsys.mu.Unlock()
 	if !ok {
-		return true, nil
+		return true, false, nil
 	}
 	if !whole {
-		return false, nil
+		return false, false, nil
 	}
 	fsys.keepOff(projectionPath)
 	if err := fsys.commitHeld(projectionPath); err != nil {
-		return false, err
+		return false, false, err
 	}
-	return true, nil
+	return true, true, nil
 }
 
 // Commit commits the writes still held for the file at name; see
@@ -640,12 +664,15 @@ func (fsys *nfsFileSystem) commitHeld(projectionPath string) error {
 
 	err := fsys.writeProjection(context.Background(), projectionPath, contents)
 	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
 	delete(fsys.pending, projectionPath)
-	fsys.contentsChangedLocked(projectionPath)
-	fsys.mu.Unlock()
 	if err != nil {
+		// A file created through the mount leaves its directory with it.
+		fsys.namespaceChangedLocked(projectionPath)
 		return pathError("write", projectionPath, errnoFor(err))
 	}
+	fsys.contentsChangedLocked(projectionPath)
+	fsys.compiled[projectionPath] = len(contents)
 	return nil
 }
 
@@ -734,22 +761,30 @@ func (fsys *nfsFileSystem) infoFor(projectionPath string, entry protocol.Entry, 
 	}
 }
 
-// modificationTime answers when the entry at projectionPath last changed, as
-// far as the daemon can tell: the NFS client keeps its cached pages and
-// listings while this holds still.
-func (fsys *nfsFileSystem) modificationTime(projectionPath string, entry protocol.Entry) time.Time {
+// modificationTime answers when the entry at projectionPath, which the stat
+// after the one numbered stat took, last changed, as far as the daemon can
+// tell: the NFS client keeps its cached pages and listings while this holds
+// still. It answers nothing when a stat that overlapped this one saw the
+// file otherwise, as nothing says which of the two saw it last: the caller
+// takes the entry again, and sees the file at least as late.
+func (fsys *nfsFileSystem) modificationTime(projectionPath string, entry protocol.Entry, stat uint64) (time.Time, bool) {
 	if entry.Kind == protocol.Directory {
-		return fsys.directoryTime(projectionPath)
+		return fsys.directoryTime(projectionPath), true
 	}
 
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 	if _, ok := fsys.pending[projectionPath]; !ok {
-		if previous, seen := fsys.sizes[projectionPath]; seen && previous != entry.Size {
+		previous, seen := fsys.seen[projectionPath]
+		if seen && (previous.size != entry.Size || previous.modified != entry.Modified) {
+			if previous.stat > stat {
+				return time.Time{}, false
+			}
 			fsys.changed[projectionPath] = fsys.nowLocked()
 			delete(fsys.reads, projectionPath)
 		}
-		fsys.sizes[projectionPath] = entry.Size
+		fsys.stats++
+		fsys.seen[projectionPath] = seenEntry{size: entry.Size, modified: entry.Modified, stat: fsys.stats}
 	}
 
 	modified := fsys.started
@@ -761,7 +796,7 @@ func (fsys *nfsFileSystem) modificationTime(projectionPath string, entry protoco
 			modified = reported
 		}
 	}
-	return modified
+	return modified, true
 }
 
 // directoryTime answers when the listing of the directory at projectionPath
@@ -774,18 +809,45 @@ func (fsys *nfsFileSystem) directoryTime(projectionPath string) time.Time {
 		return known.changed
 	}
 
-	entries, errno := fsys.entriesIn(projectionPath)
+	entries, errno := fsys.listingFor(projectionPath)
 	if errno != 0 {
 		if ok {
 			return known.changed
 		}
 		return fsys.started
 	}
-	signature := listingSignature(entries)
 
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
-	known, ok = fsys.listings[projectionPath]
+	return fsys.recordListingLocked(projectionPath, listingSignature(entries))
+}
+
+// listingFor answers the entries of the directory at projectionPath, as a
+// READDIR serves them: the image's, with the files created through this
+// mount that it does not have yet.
+func (fsys *nfsFileSystem) listingFor(projectionPath string) ([]protocol.Entry, syscall.Errno) {
+	entries, errno := fsys.entriesIn(projectionPath)
+	if errno != 0 {
+		return nil, errno
+	}
+
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	for pendingPath := range fsys.pending {
+		if path.Dir(pendingPath) == projectionPath && !containsEntryNamed(entries, path.Base(pendingPath)) {
+			entries = append(entries, protocol.Entry{Name: path.Base(pendingPath), Kind: protocol.File, Writable: true})
+		}
+	}
+	return entries, 0
+}
+
+// recordListingLocked records a listing of the directory at projectionPath,
+// just taken, and answers the directory's time. The time moves whenever the
+// listing differs from the one recorded before, whichever of two overlapping
+// listings is recorded last: so every listing served stands for a time that
+// the directory leaves once its listing is another.
+func (fsys *nfsFileSystem) recordListingLocked(projectionPath string, signature uint64) time.Time {
+	known, ok := fsys.listings[projectionPath]
 	changed := fsys.started
 	if ok {
 		changed = known.changed
@@ -803,12 +865,17 @@ func (fsys *nfsFileSystem) namespaceChanged(projectionPath string) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 
+	fsys.namespaceChangedLocked(projectionPath)
+}
+
+func (fsys *nfsFileSystem) namespaceChangedLocked(projectionPath string) {
 	now := fsys.nowLocked()
 	parent := path.Dir(projectionPath)
 	fsys.listings[parent] = listing{signature: 0, changed: now}
 	fsys.changed[projectionPath] = now
 	delete(fsys.reads, projectionPath)
-	delete(fsys.sizes, projectionPath)
+	delete(fsys.seen, projectionPath)
+	delete(fsys.compiled, projectionPath)
 }
 
 // contentsChanged records that the contents at projectionPath changed
@@ -823,13 +890,15 @@ func (fsys *nfsFileSystem) contentsChanged(projectionPath string) {
 func (fsys *nfsFileSystem) contentsChangedLocked(projectionPath string) {
 	fsys.changed[projectionPath] = fsys.nowLocked()
 	delete(fsys.reads, projectionPath)
-	delete(fsys.sizes, projectionPath)
+	delete(fsys.seen, projectionPath)
 }
 
-// nowLocked answers the current time, after every time it answered before,
-// so that two changes in a row never share a modification time.
+// nowLocked answers the current time on the wall clock, which is what a
+// client is sent, after every time it answered before, even when the wall
+// clock steps back: so two changes in a row never share a modification time,
+// and none goes back.
 func (fsys *nfsFileSystem) nowLocked() time.Time {
-	now := time.Now()
+	now := fsys.clock().Round(0)
 	if !now.After(fsys.last) {
 		now = fsys.last.Add(time.Microsecond)
 	}
@@ -917,6 +986,13 @@ func (fsys *nfsFileSystem) writeAt(file *nfsFile, data []byte, offset int64) err
 
 // truncate resizes file, held in pending or in the overlay, wherever file is
 // by now.
+//
+// A client flushes what it wrote to a file before it sets the file's size,
+// so no write follows a size set on a projected file with nothing held, but
+// the 0 a save starts with. The file already has that size when it is the
+// image's, or that of what the client wrote and the image compiled, which a
+// client writing a file in place sets after; otherwise the file is compiled,
+// cut to that size, now.
 func (fsys *nfsFileSystem) truncate(file *nfsFile, size int64) error {
 	if size < 0 {
 		return pathError("truncate", file.path, syscall.EINVAL)
@@ -925,7 +1001,7 @@ func (fsys *nfsFileSystem) truncate(file *nfsFile, size int64) error {
 		return pathError("truncate", file.path, syscall.EFBIG)
 	}
 	fsys.changing.Lock()
-	defer fsys.changing.Unlock()
+	defer fsys.endChange()
 	projectionPath, ok := fsys.ids.pathFor(file.id)
 	if !ok {
 		return pathError("truncate", file.path, syscall.ESTALE)
@@ -946,22 +1022,41 @@ func (fsys *nfsFileSystem) truncate(file *nfsFile, size int64) error {
 	}
 
 	fsys.mu.Lock()
-	_, held := fsys.pending[projectionPath]
-	if !held && size == 0 {
+	held, ok := fsys.pending[projectionPath]
+	switch {
+	case ok:
+		held.truncate(int(size))
+		fsys.mu.Unlock()
+		return nil
+	case size == 0:
 		// A save starts by emptying the file: what the image has is not needed.
 		fsys.pending[projectionPath] = &heldFile{}
 		fsys.changed[projectionPath] = fsys.nowLocked()
+		fsys.mu.Unlock()
+		return nil
 	}
+	compiled, ok := fsys.compiled[projectionPath]
 	fsys.mu.Unlock()
-	if err := fsys.hold(projectionPath); err != nil {
-		return err
+	if ok && compiled == int(size) {
+		return nil
+	}
+	entry, errno := fsys.entryForPath(projectionPath)
+	if errno != 0 {
+		return pathError("truncate", projectionPath, errno)
+	}
+	if entry.Size == uint64(size) {
+		return nil
+	}
+
+	fsys.keepOff(projectionPath)
+	contents, err := fsys.contentsForPath(projectionPath)
+	if err != nil {
+		return pathError("truncate", projectionPath, errnoFor(err))
 	}
 	fsys.mu.Lock()
-	defer fsys.mu.Unlock()
-	if held, ok := fsys.pending[projectionPath]; ok {
-		held.truncate(int(size))
-	}
-	return nil
+	fsys.pending[projectionPath] = &heldFile{contents: resizedContents(append([]byte(nil), contents...), int(size))}
+	fsys.mu.Unlock()
+	return fsys.commitHeld(projectionPath)
 }
 
 // writeKind answers where writes to projectionPath are kept now: held for

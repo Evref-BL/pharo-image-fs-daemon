@@ -1,8 +1,9 @@
 package nfs
 
 // Changed for pharo-image-fs: a write to a Committer is answered UNSTABLE
-// while the Committer holds it, and an error from the file system keeps its
-// errno's meaning (see pifs.go), STALE included.
+// while the Committer holds it, and with no pre-op attributes when it
+// committed the file; an error from the file system keeps its errno's
+// meaning (see pifs.go), STALE included.
 
 import (
 	"bytes"
@@ -92,12 +93,15 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	committed := fileSync
 	if committer, ok := fs.(Committer); ok {
-		done, err := committer.Written(fullPath, req.How != uint32(unstable))
+		done, committedNow, err := committer.Written(fullPath, req.How != uint32(unstable))
 		if err != nil {
 			return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
 		}
 		if !done {
 			committed = unstable
+		}
+		if committedNow {
+			preOpCache = nil
 		}
 	}
 
