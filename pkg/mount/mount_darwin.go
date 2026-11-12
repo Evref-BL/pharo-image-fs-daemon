@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -31,6 +30,11 @@ func Mount(mountPoint string, client protocol.Client, config Config) error {
 	if err != nil {
 		return err
 	}
+	// From now on, so that a signal while mounting unmounts once mounted
+	// rather than ending the daemon with its mount left behind.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, stopSignals()...)
+	defer signal.Stop(signals)
 
 	logger := log.New(os.Stderr, "pharo-image-fs: ", log.LstdFlags)
 	server, err := startNFSServer(client, logger)
@@ -52,8 +56,6 @@ func Mount(mountPoint string, client protocol.Client, config Config) error {
 		return fmt.Errorf("mount_nfs succeeded, but nothing is mounted at %s", mountPoint)
 	}
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, stopSignals()...)
 	gone := make(chan struct{})
 	stopWatching := watchImage(client, logger, func() { close(gone) })
 	defer stopWatching()
@@ -85,25 +87,9 @@ func mountNFSArguments(port int, mountPoint string, config Config) []string {
 		"soft", "intr", "timeo=100", "retrans=5",
 		"nobrowse",
 	}
-	export := "pharo-image-fs"
-	for _, option := range config.MountOptions {
-		if name, ok := strings.CutPrefix(option, "volname="); ok {
-			if name = exportNameFor(name); name != "" {
-				export = name
-			}
-			continue
-		}
-		options = append(options, option)
-	}
+	export, others := mountNameAndOptions(config.MountOptions)
+	options = append(options, others...)
 	return []string{"-o", strings.Join(options, ","), "127.0.0.1:/" + export, mountPoint}
-}
-
-var unsafeExportCharacters = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
-
-// exportNameFor answers name as the export path the mount table shows, so
-// that a projection's mount can be told from another's.
-func exportNameFor(name string) string {
-	return strings.Trim(unsafeExportCharacters.ReplaceAllString(name, "-"), "-")
 }
 
 // unmount unmounts the file system with fsid at mountPoint, waiting while it

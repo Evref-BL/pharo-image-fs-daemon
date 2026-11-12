@@ -44,7 +44,10 @@ type nfsFileSystem struct {
 }
 
 func newNFSFileSystem(client protocol.Client) *nfsFileSystem {
-	return &nfsFileSystem{fileSystem: newFileSystem(client), silly: map[string]string{}}
+	fsys := &nfsFileSystem{fileSystem: newFileSystem(client), silly: map[string]string{}}
+	// The client keeps a directory's listing while its time holds still.
+	fsys.listsDirectoriesOnStat = true
+	return fsys
 }
 
 // projectionPathFor answers the projection path of a go-nfs file name, which
@@ -117,6 +120,7 @@ func (fsys *nfsFileSystem) Create(name string) (billy.File, error) {
 		return fsys.newFile(name, projectionPath, overlayFile), nil
 	}
 
+	fsys.noteCreateOverBackup(projectionPath)
 	if _, errno := fsys.createFile(projectionPath); errno != 0 {
 		return nil, pathError("create", projectionPath, errno)
 	}
@@ -199,9 +203,6 @@ func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 		fsys.showHiddenClass(newPath)
 		return err
 	}
-	fsys.mu.Lock()
-	delete(fsys.pending, newPath)
-	fsys.mu.Unlock()
 
 	var errno syscall.Errno
 	if isProjectedTonelFilePath(oldPath) && isSillyRenameName(path.Base(newPath)) {
@@ -215,7 +216,7 @@ func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 		fsys.showHiddenClass(newPath)
 		return pathError("rename", newPath, errno)
 	}
-	fsys.ids.renamed(oldPath, newPath)
+	fsys.renamedOver(oldPath, newPath)
 	if original, ok := fsys.silly[oldPath]; ok {
 		delete(fsys.silly, oldPath)
 		fsys.silly[newPath] = original
@@ -247,12 +248,9 @@ func (fsys *nfsFileSystem) sillyRename(oldPath string, newPath string) syscall.E
 // an open file to ".nfs…", hid it, and the image still has it, as a refused
 // save leaves it.
 func (fsys *nfsFileSystem) showHiddenClass(projectionPath string) {
-	if !fsys.overlay.IsHidden(projectionPath) {
-		return
+	if fsys.fileSystem.showHiddenClass(projectionPath) {
+		fsys.forgetSilly(projectionPath)
 	}
-	fsys.overlay.Delete(projectionPath)
-	fsys.namespaceChanged(projectionPath)
-	fsys.forgetSilly(projectionPath)
 }
 
 // forgetSilly drops the ".nfs…" files that stand for the class at
@@ -303,7 +301,7 @@ func (fsys *nfsFileSystem) Remove(name string) error {
 	if entry.Kind == protocol.Directory {
 		errno = fsys.rmdir(projectionPath)
 	} else {
-		errno = fsys.unlink(projectionPath)
+		errno = fsys.unlinkFile(projectionPath)
 	}
 	fsys.namespaceChanged(projectionPath)
 	if errno != 0 {
