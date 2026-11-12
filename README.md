@@ -34,6 +34,8 @@ Release:
 
 - `pharo-image-fs-daemon-darwin-arm64.zip`
 - `pharo-image-fs-daemon-darwin-amd64.zip`
+- `pharo-image-fs-daemon-linux-amd64.zip`
+- `pharo-image-fs-daemon-linux-arm64.zip`, both static
 
 Create a release by pushing a matching version tag:
 

@@ -72,6 +72,8 @@ jobs:
         run: |
           go vet ./...
           go build -o /dev/null ./cmd/pharo-image-fs
+          GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/pharo-image-fs
+          GOOS=darwin GOARCH=amd64 go build -o /dev/null ./cmd/pharo-image-fs
 
   # The one check main's ruleset requires: it fails unless every job above
   # passed, so the rule names no job, nor any runner of a matrix.
