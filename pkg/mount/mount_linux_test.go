@@ -260,7 +260,7 @@ with open(sys.argv[1], 'r+') as f:
 		})
 	})
 
-	t.Run("removing an open file removes its class, and its reader goes on", func(t *testing.T) {
+	t.Run("removing an open file removes its class, and leaves its reader stale", func(t *testing.T) {
 		reader, err := os.Open(path(other))
 		if err != nil {
 			t.Fatalf("open: %v", err)
@@ -272,8 +272,9 @@ with open(sys.argv[1], 'r+') as f:
 		if client.has(other) {
 			t.Fatalf("removing a file should remove its class")
 		}
-		if contents, err := io.ReadAll(reader); err != nil || !strings.Contains(string(contents), "Other") {
-			t.Fatalf("the open descriptor should still read what it had, got %q, %v", contents, err)
+		// As for a file removed on an NFS server.
+		if contents, err := io.ReadAll(reader); !errors.Is(err, syscall.ESTALE) {
+			t.Fatalf("a removed file's descriptor should read stale, got %q, %v", contents, err)
 		}
 	})
 }

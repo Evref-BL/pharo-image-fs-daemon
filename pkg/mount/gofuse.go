@@ -42,6 +42,8 @@ type fuseFileSystem struct {
 	// handles guards what follows and each fuseFile's state. It is taken
 	// after changing, never before.
 	handles sync.Mutex
+	// open counts each id's open files.
+	open map[uint64]int
 	// writers holds, for each path, the open files whose writes the writes
 	// held there carry.
 	writers map[string]map[*fuseFile]struct{}
@@ -52,6 +54,7 @@ type fuseFileSystem struct {
 func newFuseFileSystem(client protocol.Client) *fuseFileSystem {
 	return &fuseFileSystem{
 		fileSystem:    newFileSystem(client),
+		open:          map[uint64]int{},
 		writers:       map[string]map[*fuseFile]struct{}{},
 		threadGroupOf: threadGroupOf,
 	}
@@ -297,7 +300,7 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		file.opener = n.fsys.callerProcess(ctx)
 	}
 	if !file.writable {
-		if errno := n.observe(n.path, func(string) error { return nil }); errno != 0 {
+		if errno := n.fsys.openForReading(file); errno != 0 {
 			return nil, 0, errno
 		}
 		n.dropCachedAttributes()
@@ -311,14 +314,15 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 }
 
 // Create creates a file. Creating is not writing: a class file closed with
-// nothing written compiles nothing, and stays listed, empty, until something
-// writes it, renames over it or removes it, as on macOS.
+// nothing written compiles nothing, and leaves once no one has it open, so
+// that it never hides the class the image defines later.
 func (n *fuseNode) Create(ctx context.Context, name string, flags uint32, _ uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	node, errno := n.fsys.create(n, name)
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
 	file := &fuseFile{node: node, writable: true, appends: flags&linuxOpenAppend != 0, syncs: flags&linuxOpenDataSync != 0, opener: n.fsys.callerProcess(ctx)}
+	n.fsys.opened(file)
 	var attributes fuse.AttrOut
 	if errno := node.Getattr(ctx, file, &attributes); errno == 0 {
 		out.Attr = attributes.Attr
@@ -567,6 +571,7 @@ func (fsys *fuseFileSystem) openForWriting(file *fuseFile, truncates bool) sysca
 			fsys.handles.Unlock()
 		}
 	}
+	fsys.opened(file)
 	return 0
 }
 
@@ -780,6 +785,80 @@ func (fsys *fuseFileSystem) release(file *fuseFile) {
 		}
 	}
 	fsys.handles.Unlock()
+	if fsys.closed(file) {
+		fsys.dropUnwrittenCreation(file.node)
+	}
+}
+
+// opened counts file among its id's open files.
+func (fsys *fuseFileSystem) opened(file *fuseFile) {
+	fsys.handles.Lock()
+	defer fsys.handles.Unlock()
+	fsys.open[file.node.id]++
+}
+
+// closed forgets file among its id's open files, and answers whether it was
+// the last.
+func (fsys *fuseFileSystem) closed(file *fuseFile) bool {
+	fsys.handles.Lock()
+	defer fsys.handles.Unlock()
+	id := file.node.id
+	fsys.open[id]--
+	if fsys.open[id] > 0 {
+		return false
+	}
+	delete(fsys.open, id)
+	return true
+}
+
+// openForReading counts file among its id's open files once no change of its
+// path runs, or answers ESTALE when the file went meanwhile: the kernel then
+// looks the name up again. It counts first, so that a created file is not
+// dropped under an open that is still on its way.
+func (fsys *fuseFileSystem) openForReading(file *fuseFile) syscall.Errno {
+	fsys.opened(file)
+	if errno := file.node.observe(file.node.path, func(string) error { return nil }); errno != 0 {
+		fsys.closed(file)
+		return errno
+	}
+	return 0
+}
+
+// dropUnwrittenCreation drops the writes held for node's file when no one
+// has it open and no file wrote them: a class file created, and closed with
+// nothing written. Nothing would ever compile them, and they would hide the
+// class the image defines later.
+func (fsys *fuseFileSystem) dropUnwrittenCreation(node *fuseNode) {
+	projectionPath, errno := node.path()
+	if errno != 0 {
+		return
+	}
+	fsys.mu.Lock()
+	_, held := fsys.pending[projectionPath]
+	fsys.mu.Unlock()
+	if !held {
+		return
+	}
+
+	fsys.changing.Lock()
+	defer fsys.endChange()
+	fsys.handles.Lock()
+	unwritten := fsys.open[node.id] == 0 && len(fsys.writers[projectionPath]) == 0
+	fsys.handles.Unlock()
+	if !unwritten {
+		return
+	}
+	fsys.keepOff(projectionPath)
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	if _, held := fsys.pending[projectionPath]; held {
+		delete(fsys.pending, projectionPath)
+		fsys.namespaceChangedLocked(projectionPath)
+		if _, errno := fsys.entryForPath(projectionPath); errno == syscall.ENOENT {
+			// Its nodes are stale, and the kernel looks its name up again.
+			fsys.ids.removed(projectionPath)
+		}
+	}
 }
 
 // create creates name in parent's directory: held for the image when it
