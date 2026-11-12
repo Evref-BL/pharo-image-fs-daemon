@@ -15,29 +15,9 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.asset }}
-    runs-on: ${{ matrix.runner }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-26
-            asset: pharo-image-fs-daemon-darwin-arm64
-          - runner: macos-26-intel
-            asset: pharo-image-fs-daemon-darwin-amd64
-          # Static: a Linux user needs fusermount3, and nothing else.
-          - runner: ubuntu-24.04
-            asset: pharo-image-fs-daemon-linux-amd64
-            goos: linux
-            goarch: amd64
-            cgo: "0"
-          - runner: ubuntu-24.04
-            asset: pharo-image-fs-daemon-linux-arm64
-            goos: linux
-            goarch: arm64
-            cgo: "0"
+  release:
+    name: Build and publish
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -51,44 +31,22 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      # Static, so a user installs nothing for the daemon; one runner builds
+      # every asset, and Go's linker signs darwin/arm64 ad hoc, as macOS
+      # requires.
       - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: ${{ matrix.cgo }}
+          CGO_ENABLED: "0"
         run: |
-          go build -trimpath -ldflags="-s -w" -o dist/pharo-image-fs ./cmd/pharo-image-fs
-          if [ "${{ matrix.cgo }}" = "0" ]; then
-            go version -m dist/pharo-image-fs | grep -q 'CGO_ENABLED=0'
-          fi
-
-      - name: Package
-        run: |
-          cd dist
-          shasum -a 256 pharo-image-fs > pharo-image-fs.sha256
-          zip ${{ matrix.asset }}.zip pharo-image-fs pharo-image-fs.sha256
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}.zip
-          if-no-files-found: error
-
-  publish:
-    name: Publish GitHub Release
-    needs: build
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v6
-        with:
-          path: dist
-          merge-multiple: true
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            asset="pharo-image-fs-daemon-${target%/*}-${target#*/}"
+            mkdir -p "build/$asset"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -ldflags="-s -w" -o "build/$asset/pharo-image-fs" ./cmd/pharo-image-fs
+            (cd "build/$asset" && sha256sum pharo-image-fs > pharo-image-fs.sha256 && zip "../$asset.zip" pharo-image-fs pharo-image-fs.sha256)
+          done
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: dist/*.zip
+          files: build/*.zip

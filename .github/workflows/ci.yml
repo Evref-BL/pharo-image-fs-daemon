@@ -72,6 +72,8 @@ jobs:
         run: |
           go vet ./...
           go build -o /dev/null ./cmd/pharo-image-fs
+          GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/pharo-image-fs
+          GOOS=darwin GOARCH=amd64 go build -o /dev/null ./cmd/pharo-image-fs
 
   windows:
     name: Windows (WinFsp, built)
