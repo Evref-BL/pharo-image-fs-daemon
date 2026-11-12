@@ -531,25 +531,21 @@ func TestFUSESizesSetWithAndWithoutAFile(t *testing.T) {
 	}
 }
 
-func TestFUSECreatedFileClosedUnwrittenStaysUntilRemoved(t *testing.T) {
+func TestFUSECreatedFileClosedUnwrittenLeaves(t *testing.T) {
 	client := newMemoryClient(map[string]string{objectPath: "source"})
 	k := newTestKernel(t, client)
 	created := "/tonel/Kernel/New.class.st"
 	file := k.mustCreate(created, openWriteOnly, writer)
+	if names := k.list("/tonel/Kernel"); !slices.Contains(names, "New.class.st") {
+		t.Fatalf("a created file should be listed, got %v", names)
+	}
 	k.close(file, writer)
 	k.release(file)
 	if writes := client.writes(); len(writes) != 0 {
 		t.Fatalf("creating is not writing, got %v", writes)
 	}
-	// As on macOS: listed, empty, until something writes or removes it.
-	if names := k.list("/tonel/Kernel"); !slices.Contains(names, "New.class.st") {
-		t.Fatalf("a class file closed unwritten should stay listed, got %v", names)
-	}
-	if status := k.unlink(created); status != fuse.OK {
-		t.Fatalf("unlink: %v", status)
-	}
 	if names := k.list("/tonel/Kernel"); slices.Contains(names, "New.class.st") {
-		t.Fatalf("a removed class file should leave, got %v", names)
+		t.Fatalf("a class file closed unwritten should leave, got %v", names)
 	}
 }
 
@@ -1034,17 +1030,26 @@ func TestFUSEOpeningAClassTheImageRemovedIsStale(t *testing.T) {
 
 func TestFUSEACreatedFileThatLeftIsStale(t *testing.T) {
 	created := "/tonel/Kernel/New.class.st"
-	k := newTestKernel(t, newMemoryClient(map[string]string{objectPath: "source"}))
-	file := k.mustCreate(created, openWriteOnly, writer)
-	k.mustWrite(file, 0, "syntax error")
-	k.close(file, writer)
-	k.release(file)
-	// The kernel still trusts the name, and opens its node.
-	for _, flags := range []uint32{openWriteOnly | openTruncate, openReadOnly} {
-		in := fuse.OpenIn{InHeader: header(file.node, writer), Flags: flags}
-		var out fuse.OpenOut
-		if status := k.raw.Open(nil, &in, &out); status != fuse.Status(syscall.ESTALE) {
-			t.Fatalf("opening a refused created file should be stale, so the kernel looks the name up again, got %v", status)
+	for name, leave := range map[string]func(*testKernel, openedFile){
+		"refused": func(k *testKernel, file openedFile) {
+			k.mustWrite(file, 0, "syntax error")
+			k.close(file, writer)
+		},
+		"unwritten": func(k *testKernel, file openedFile) {
+			k.close(file, writer)
+		},
+	} {
+		k := newTestKernel(t, newMemoryClient(map[string]string{objectPath: "source"}))
+		file := k.mustCreate(created, openWriteOnly, writer)
+		leave(k, file)
+		k.release(file)
+		// The kernel still trusts the name, and opens its node.
+		for _, flags := range []uint32{openWriteOnly | openTruncate, openReadOnly} {
+			in := fuse.OpenIn{InHeader: header(file.node, writer), Flags: flags}
+			var out fuse.OpenOut
+			if status := k.raw.Open(nil, &in, &out); status != fuse.Status(syscall.ESTALE) {
+				t.Fatalf("%s: opening a created file that left should be stale, so the kernel looks the name up again, got %v", name, status)
+			}
 		}
 	}
 }
