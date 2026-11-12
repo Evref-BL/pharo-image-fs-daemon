@@ -13,9 +13,8 @@ import (
 // closeInheritedDescriptors closes the descriptors above standard error the
 // daemon was started with. The image that starts it passes its own down, its
 // listening sockets among them, which the daemon would keep open after the
-// image is gone; the shell that starts it cannot close them all, since dash
-// reads only one-digit descriptors. Every descriptor the daemon opens itself
-// is closed on exec, which tells the two apart.
+// image is gone, and never notice it went. Every descriptor the daemon opens
+// itself is closed on exec, which tells the two apart.
 func closeInheritedDescriptors() {
 	directory := "/dev/fd"
 	if runtime.GOOS == "linux" {

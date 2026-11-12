@@ -216,12 +216,7 @@ func (fsys *nfsFileSystem) Rename(oldName string, newName string) error {
 		fsys.showHiddenClass(newPath)
 		return pathError("rename", newPath, errno)
 	}
-	// What was held for the file the rename replaced goes with it.
-	fsys.mu.Lock()
-	delete(fsys.pending, newPath)
-	fsys.mu.Unlock()
 	fsys.renamedOver(oldPath, newPath)
-	fsys.ids.renamed(oldPath, newPath)
 	if original, ok := fsys.silly[oldPath]; ok {
 		delete(fsys.silly, oldPath)
 		fsys.silly[newPath] = original

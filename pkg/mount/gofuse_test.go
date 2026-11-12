@@ -472,6 +472,23 @@ func TestFUSEAppendsAtTheEndTheFileHas(t *testing.T) {
 	}
 }
 
+// An append past the largest file is refused, and leaves nothing held: the
+// image's later changes still show.
+func TestFUSEARefusedAppendHoldsNothing(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: strings.Repeat("x", maxFileSize-1)})
+	k := newTestKernel(t, client)
+	file := k.mustOpen(objectPath, openWriteOnly|openAppend, writer)
+	if status := k.write(file, 0, "ab"); status != fuse.Status(syscall.EFBIG) {
+		t.Fatalf("an append past the largest file should be refused, got %v", status)
+	}
+	client.put(objectPath, "changed in the image")
+	if contents := k.readFile(objectPath); contents != "changed in the image" {
+		t.Fatalf("a refused append should hold nothing, read %d bytes", len(contents))
+	}
+	k.close(file, writer)
+	k.release(file)
+}
+
 func TestFUSESizesSetWithAndWithoutAFile(t *testing.T) {
 	// f.write(source); f.truncate(); f.close()
 	client := newMemoryClient(map[string]string{objectPath: "an old source"})
@@ -514,21 +531,25 @@ func TestFUSESizesSetWithAndWithoutAFile(t *testing.T) {
 	}
 }
 
-func TestFUSECreatedFileClosedUnwrittenLeaves(t *testing.T) {
+func TestFUSECreatedFileClosedUnwrittenStaysUntilRemoved(t *testing.T) {
 	client := newMemoryClient(map[string]string{objectPath: "source"})
 	k := newTestKernel(t, client)
 	created := "/tonel/Kernel/New.class.st"
 	file := k.mustCreate(created, openWriteOnly, writer)
-	if names := k.list("/tonel/Kernel"); !slices.Contains(names, "New.class.st") {
-		t.Fatalf("a created file should be listed, got %v", names)
-	}
 	k.close(file, writer)
 	k.release(file)
 	if writes := client.writes(); len(writes) != 0 {
 		t.Fatalf("creating is not writing, got %v", writes)
 	}
+	// As on macOS: listed, empty, until something writes or removes it.
+	if names := k.list("/tonel/Kernel"); !slices.Contains(names, "New.class.st") {
+		t.Fatalf("a class file closed unwritten should stay listed, got %v", names)
+	}
+	if status := k.unlink(created); status != fuse.OK {
+		t.Fatalf("unlink: %v", status)
+	}
 	if names := k.list("/tonel/Kernel"); slices.Contains(names, "New.class.st") {
-		t.Fatalf("a class file closed unwritten should leave, got %v", names)
+		t.Fatalf("a removed class file should leave, got %v", names)
 	}
 }
 
@@ -643,26 +664,39 @@ func TestFUSERefusedRenameSaveShowsTheBackedUpClassAgain(t *testing.T) {
 	}
 }
 
-func TestFUSERemovingAnOpenFileRemovesItsClassAndKeepsItsReaders(t *testing.T) {
+func TestFUSERemovingAnOpenFileRemovesItsClassAndLeavesItsDescriptorsStale(t *testing.T) {
 	client := newMemoryClient(map[string]string{objectPath: "old source", "/tonel/Kernel/Other.class.st": "other"})
 	k := newTestKernel(t, client)
 	reader := k.mustOpen(objectPath, openReadOnly, writer)
+	writable := k.mustOpen(objectPath, openReadWrite, child)
+	k.mustWrite(writable, 0, "held")
 	if status := k.unlink(objectPath); status != fuse.OK {
 		t.Fatalf("unlink: %v", status)
 	}
 	if client.has(objectPath) {
 		t.Fatalf("removing a file should remove its class at once")
 	}
-	if contents, status := k.read(reader); status != fuse.OK || contents != "old source" {
-		t.Fatalf("an open descriptor should still read what it had, got %q %v", contents, status)
+	// As for a file removed on an NFS server.
+	if _, status := k.read(reader); status != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("a removed file's descriptor should read stale, got %v", status)
 	}
-	if attributes, status := k.getattr(reader.node); status != fuse.OK || attributes.Nlink != 0 {
-		t.Fatalf("a removed file should have no link, got %+v %v", attributes, status)
+	if _, status := k.getattr(reader.node); status != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("a removed file's descriptor should stat stale, got %v", status)
 	}
+	if status := k.write(writable, 0, "more"); status != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("a removed file's descriptor should write stale, got %v", status)
+	}
+	if status := k.close(writable, child); status != fuse.OK {
+		t.Fatalf("close: %v", status)
+	}
+	k.release(writable)
 	k.release(reader)
+	if writes := client.writes(); len(writes) != 0 {
+		t.Fatalf("a removed file compiles nothing, got %v", writes)
+	}
 }
 
-func TestFUSEReplacingAnOpenFileKeepsItsReaders(t *testing.T) {
+func TestFUSEReplacingAnOpenFileLeavesItsDescriptorsStale(t *testing.T) {
 	k := newTestKernel(t, newMemoryClient(map[string]string{objectPath: "old source"}))
 	reader := k.mustOpen(objectPath, openReadOnly, writer)
 	temp := "/tonel/Kernel/sedAb12Cd"
@@ -673,8 +707,8 @@ func TestFUSEReplacingAnOpenFileKeepsItsReaders(t *testing.T) {
 	if status := k.rename(temp, objectPath, 0); status != fuse.OK {
 		t.Fatalf("rename: %v", status)
 	}
-	if contents, _ := k.read(reader); contents != "old source" {
-		t.Fatalf("a descriptor of the replaced file should read what it had, got %q", contents)
+	if _, status := k.read(reader); status != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("a descriptor of the replaced file should read stale, got %v", status)
 	}
 	k.release(reader)
 	if contents := k.readFile(objectPath); contents != "new source" {
@@ -1000,106 +1034,52 @@ func TestFUSEOpeningAClassTheImageRemovedIsStale(t *testing.T) {
 
 func TestFUSEACreatedFileThatLeftIsStale(t *testing.T) {
 	created := "/tonel/Kernel/New.class.st"
-	for name, leave := range map[string]func(*testKernel, openedFile){
-		"refused": func(k *testKernel, file openedFile) {
-			k.mustWrite(file, 0, "syntax error")
-			k.close(file, writer)
-		},
-		"unwritten": func(k *testKernel, file openedFile) {
-			k.close(file, writer)
-		},
-	} {
-		k := newTestKernel(t, newMemoryClient(map[string]string{objectPath: "source"}))
-		file := k.mustCreate(created, openWriteOnly, writer)
-		leave(k, file)
-		k.release(file)
-		// The kernel still trusts the name, and opens its node.
-		for _, flags := range []uint32{openWriteOnly | openTruncate, openReadOnly} {
-			in := fuse.OpenIn{InHeader: header(file.node, writer), Flags: flags}
-			var out fuse.OpenOut
-			if status := k.raw.Open(nil, &in, &out); status != fuse.Status(syscall.ESTALE) {
-				t.Fatalf("%s: opening a created file that left should be stale, so the kernel looks the name up again, got %v", name, status)
-			}
+	k := newTestKernel(t, newMemoryClient(map[string]string{objectPath: "source"}))
+	file := k.mustCreate(created, openWriteOnly, writer)
+	k.mustWrite(file, 0, "syntax error")
+	k.close(file, writer)
+	k.release(file)
+	// The kernel still trusts the name, and opens its node.
+	for _, flags := range []uint32{openWriteOnly | openTruncate, openReadOnly} {
+		in := fuse.OpenIn{InHeader: header(file.node, writer), Flags: flags}
+		var out fuse.OpenOut
+		if status := k.raw.Open(nil, &in, &out); status != fuse.Status(syscall.ESTALE) {
+			t.Fatalf("opening a refused created file should be stale, so the kernel looks the name up again, got %v", status)
 		}
 	}
 }
 
-func TestFUSEOpenDescriptorsGoOnThroughARemoval(t *testing.T) {
-	client := newGatedClient(map[string]string{objectPath: "old source", "/tonel/Kernel/Other.class.st": "other"})
+func TestFUSEAnOpenRacingARemovalIsStale(t *testing.T) {
+	client := newGatedClient(map[string]string{objectPath: "old source"})
 	k := newTestKernel(t, client)
-	reader := k.mustOpen(objectPath, openReadOnly, writer)
-	node := reader.node
-
-	started, open := client.holdNext("delete")
-	defer open()
-	removed := make(chan fuse.Status, 1)
-	go func() { removed <- k.unlink(objectPath) }()
-	waitHeld(t, started)
-	read := make(chan string, 1)
-	go func() {
-		contents, _ := k.read(reader)
-		read <- contents
-	}()
-	stat := make(chan fuse.Status, 1)
-	go func() {
-		_, status := k.getattr(node)
-		stat <- status
-	}()
-	opened := make(chan fuse.Status, 1)
-	go func() {
-		in := fuse.OpenIn{InHeader: header(node, writer), Flags: openReadOnly}
-		var out fuse.OpenOut
-		opened <- k.raw.Open(nil, &in, &out)
-	}()
-	time.Sleep(50 * time.Millisecond)
-	open()
-	if status := within(t, removed, "unlink"); status != fuse.OK {
-		t.Fatalf("unlink: %v", status)
-	}
-	if contents := within(t, read, "read"); contents != "old source" {
-		t.Fatalf("a read of an open descriptor overlapping its removal should answer what it had, got %q", contents)
-	}
-	if status := within(t, stat, "stat"); status != fuse.OK {
-		t.Fatalf("a stat of an open descriptor overlapping its removal should answer its copy, got %v", status)
-	}
-	// As on a disk, an open that raced the removal has the file too.
-	if status := within(t, opened, "open"); status != fuse.OK {
-		t.Fatalf("an open racing the removal of an open file should have its copy, got %v", status)
-	}
-
-	// A file no one had open is gone for an open that raced its removal.
-	lone := "/tonel/Kernel/Lone.class.st"
-	client.put(lone, "lone")
-	loneNode := k.node(lone)
-	started, open = client.holdNext("delete")
-	go func() { removed <- k.unlink(lone) }()
-	waitHeld(t, started)
-	go func() {
-		in := fuse.OpenIn{InHeader: header(loneNode, writer), Flags: openReadOnly}
-		var out fuse.OpenOut
-		opened <- k.raw.Open(nil, &in, &out)
-	}()
-	time.Sleep(50 * time.Millisecond)
-	open()
-	within(t, removed, "unlink")
-	if status := within(t, opened, "open"); status != fuse.Status(syscall.ESTALE) {
-		t.Fatalf("an open racing the removal of a file no one had open should be stale, so the kernel looks the name up again, got %v", status)
-	}
-
-	// Its writes and sizes change only its copy.
-	writable := k.mustOpen("/tonel/Kernel/Other.class.st", openReadWrite, writer)
-	k.unlink("/tonel/Kernel/Other.class.st")
-	k.mustWrite(writable, 0, "OTHER")
-	if status := k.setSize(writable.node, &writable, 3); status != fuse.OK {
-		t.Fatalf("ftruncate: %v", status)
-	}
-	if contents, _ := k.read(writable); contents != "OTH" {
-		t.Fatalf("a removed file's writes and sizes should change its copy, read %q", contents)
-	}
-	k.close(writable, writer)
-	k.release(writable)
-	if writes := client.writes(); len(writes) != 0 {
-		t.Fatalf("a removed file compiles nothing, got %v", writes)
+	for _, alreadyOpen := range []bool{false, true} {
+		lone := "/tonel/Kernel/Lone.class.st"
+		client.put(lone, "lone")
+		node := k.node(lone)
+		var reader openedFile
+		if alreadyOpen {
+			reader = k.mustOpen(lone, openReadOnly, writer)
+		}
+		started, open := client.holdNext("delete")
+		removed := make(chan fuse.Status, 1)
+		go func() { removed <- k.unlink(lone) }()
+		waitHeld(t, started)
+		opened := make(chan fuse.Status, 1)
+		go func() {
+			in := fuse.OpenIn{InHeader: header(node, writer), Flags: openReadOnly}
+			var out fuse.OpenOut
+			opened <- k.raw.Open(nil, &in, &out)
+		}()
+		time.Sleep(50 * time.Millisecond)
+		open()
+		within(t, removed, "unlink")
+		// Stale, so the kernel looks the name up again.
+		if status := within(t, opened, "open"); status != fuse.Status(syscall.ESTALE) {
+			t.Fatalf("open already=%v: an open racing a removal should be stale, got %v", alreadyOpen, status)
+		}
+		if alreadyOpen {
+			k.release(reader)
+		}
 	}
 }
 
