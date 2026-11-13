@@ -29,8 +29,14 @@ import (
 // NFS has no open or close, and a client does not tell the writer that a
 // COMMIT failed; it does tell it that a write failed. So a projected Tonel
 // file's writes are held until they make a whole file, and the write that
-// completes it compiles it: a refused compile fails that write, and the
-// writer's close(2). Editors' and macOS's own files live in the overlay.
+// completes it compiles it. The mount is synchronous (see
+// mountNFSArguments), so a refused compile fails the write(2) that completes
+// the file: a writer that checks nothing else sees it. A file whose size is
+// a multiple of the page size compiles at the COMMIT, and its refusal
+// reaches only /errors. The calls a refused save still makes, the client
+// sending the file again and the writer setting its size, answer as that
+// save and compile nothing (see refusalLocked). Editors' and macOS's own
+// files live in the overlay.
 //
 // The names go-nfs passes carry the id of the file their handle named (see
 // componentsFor), so each call acts on that file wherever it is by then.
@@ -47,6 +53,8 @@ func newNFSFileSystem(client protocol.Client) *nfsFileSystem {
 	fsys := &nfsFileSystem{fileSystem: newFileSystem(client), silly: map[string]string{}}
 	// The client keeps a directory's listing while its time holds still.
 	fsys.listsDirectoriesOnStat = true
+	// The client sends a refused file again as it drops it from its cache.
+	fsys.answersRefusedSaves = true
 	return fsys
 }
 
@@ -128,9 +136,7 @@ func (fsys *nfsFileSystem) Create(name string) (billy.File, error) {
 	kind := overlayFile
 	if isProjectedTonelFilePath(projectionPath) {
 		fsys.overlay.Delete(projectionPath)
-		fsys.mu.Lock()
-		fsys.pending[projectionPath] = &heldFile{}
-		fsys.mu.Unlock()
+		fsys.startSaveLocked(projectionPath)
 		kind = pendingFile
 	}
 	fsys.ids.removed(projectionPath)
@@ -426,11 +432,12 @@ func (fsys *nfsFileSystem) Chown(string, int, int) error               { return 
 func (fsys *nfsFileSystem) Chtimes(string, time.Time, time.Time) error { return nil }
 
 // Written commits the writes held for the file at name once they make a
-// whole file; see nfs.Committer. A client writes whole pages, but for the
-// last one of a file: so held writes that cover the file and end inside a
-// page are a whole file, and one whose size is a multiple of the page size
-// waits for the COMMIT. A compiled file holds what the image renders, which
-// may differ from what was written.
+// whole file; see nfs.Committer. The mount is synchronous, so each write(2)
+// is sent before it returns, and held writes from 0 that end inside a page
+// are taken as the whole file: a writer that writes in chunks not aligned to
+// pages has its first chunk compiled alone, and a file whose size is a
+// multiple of the page size waits for the COMMIT. A compiled file holds what
+// the image renders, which may differ from what was written.
 func (fsys *nfsFileSystem) Written(name string, _ bool) (committed bool, compiled bool, err error) {
 	paths, err := fsys.beginChange("write", name)
 	if err != nil {

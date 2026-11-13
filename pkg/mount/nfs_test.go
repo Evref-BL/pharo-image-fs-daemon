@@ -193,6 +193,138 @@ func TestNFSUnchangedPartsOfAFileSurviveAPartialWrite(t *testing.T) {
 	}
 }
 
+func TestNFSAWriteFromTheStartWithNothingHeldStartsTheFileOver(t *testing.T) {
+	// Bun's fs.writeFile, which OpenCode saves with, opens without O_TRUNC,
+	// writes, then sets the size of what it wrote.
+	long := "Object >> a [ ^ 1 + 2 ]\n"
+	short := "Object >> a [ ^ 3 ]\n"
+	client := newMemoryClient(map[string]string{objectPath: long})
+	fsys := newNFSFileSystem(client)
+
+	if committed, err := writeAsNFS(t, fsys, objectPath, short, 0); !committed || err != nil {
+		t.Fatalf("a write from the start that ends inside a page should compile: %v, %v", committed, err)
+	}
+	truncateAsNFS(t, fsys, objectPath, int64(len(short)))
+	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=" + short}) {
+		t.Fatalf("the image should compile the bytes written, once, without the old file's end, got %q", writes)
+	}
+	if contents := readAsNFS(t, fsys, objectPath); contents != short {
+		t.Fatalf("read %q", contents)
+	}
+}
+
+func TestNFSTheSizeARefusedWriterSetsLeavesTheImagesVersion(t *testing.T) {
+	old := "Object >> a [ ^ 1 + 2 ]\n"
+	client := newMemoryClient(map[string]string{objectPath: old})
+	fsys := newNFSFileSystem(client)
+
+	// Bun's fs.writeFile sets the size of what write(2) took: nothing, when
+	// the write that completed the file was refused,
+	if _, err := writeAsNFS(t, fsys, objectPath, "syntax error", 0); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("a refused compile should fail the write with EIO, got %v", err)
+	}
+	truncateAsNFS(t, fsys, objectPath, 0)
+	if contents := readAsNFS(t, fsys, objectPath); contents != old {
+		t.Fatalf("the image's version should stand, read %q", contents)
+	}
+	if size := statSize(t, fsys); size != len(old) {
+		t.Fatalf("the file should have the image's size, has %d", size)
+	}
+
+	// and the whole file, when the refusal came at the COMMIT.
+	page := strings.Repeat("syntax error ", pageSize/13+1)[:pageSize]
+	if committed, err := writeAsNFS(t, fsys, objectPath, page, 0); committed || err != nil {
+		t.Fatalf("a file of whole pages should wait for the COMMIT: %v, %v", committed, err)
+	}
+	if err := fsys.Commit(objectPath); err != nil {
+		t.Fatalf("a refused commit is recorded, not answered: %v", err)
+	}
+	truncateAsNFS(t, fsys, objectPath, pageSize)
+	if contents := readAsNFS(t, fsys, objectPath); contents != old {
+		t.Fatalf("the image's version should stand, read %d bytes", len(contents))
+	}
+	if writes := client.writes(); len(writes) != 0 {
+		t.Fatalf("no size a refused writer sets should compile, got %d compiles", len(writes))
+	}
+	if refusals := refusalsIn(t, fsys); len(refusals) != 2 {
+		t.Fatalf("each refused save should be recorded once, got %d records", len(refusals))
+	}
+
+	// A save that empties the file, then writes, still compiles: the refused
+	// writer has set its size, so this one begins a new save.
+	truncateAsNFS(t, fsys, objectPath, 0)
+	if contents := readAsNFS(t, fsys, objectPath); contents != "" {
+		t.Fatalf("emptying the file should begin a new save, read %d bytes", len(contents))
+	}
+	if committed, err := writeAsNFS(t, fsys, objectPath, "new source", 0); !committed || err != nil {
+		t.Fatalf("save: %v, %v", committed, err)
+	}
+	if contents := client.contents(objectPath); contents != "new source" {
+		t.Fatalf("the image has %q", contents)
+	}
+}
+
+func TestNFSARefusedFileSentAgainIsAnsweredWithItsRefusal(t *testing.T) {
+	image := "source, longer than the refused save"
+	fsys := newNFSFileSystem(&echoRefusingClient{newMemoryClient(map[string]string{objectPath: image})})
+	now := time.Now()
+	fsys.clock = func() time.Time { return now }
+
+	truncateAsNFS(t, fsys, objectPath, 0)
+	if _, err := writeAsNFS(t, fsys, objectPath, "refused save", 0); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("a refused compile should fail the write with EIO, got %v", err)
+	}
+	// The client sends it again as it drops it from its cache.
+	if _, err := writeAsNFS(t, fsys, objectPath, "refused save", 0); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("the file sent again should be answered with its refusal, got %v", err)
+	}
+	refusals := refusalsIn(t, fsys)
+	if len(refusals) != 1 || !strings.Contains(refusals[0], "refused save") || strings.Contains(refusals[0], "longer") {
+		t.Fatalf("the refused save should be compiled and recorded once, as written, got %q", refusals)
+	}
+	if contents := readAsNFS(t, fsys, objectPath); contents != image {
+		t.Fatalf("the image's version should stand, read %q", contents)
+	}
+
+	// A new save compiles again, even the same file,
+	truncateAsNFS(t, fsys, objectPath, 0)
+	_, _ = writeAsNFS(t, fsys, objectPath, "refused save", 0)
+	if refusals := refusalsIn(t, fsys); len(refusals) != 2 {
+		t.Fatalf("a new save should compile, got %d records", len(refusals))
+	}
+	// and so does a write once the refused save is over.
+	now = now.Add(refusedSaveLasts)
+	_, _ = writeAsNFS(t, fsys, objectPath, "refused save", 0)
+	if refusals := refusalsIn(t, fsys); len(refusals) != 3 {
+		t.Fatalf("a write a second after the refusal should compile, got %d records", len(refusals))
+	}
+}
+
+func TestNFSARefusedFileSentAgainInPiecesIsAnsweredWithItsRefusal(t *testing.T) {
+	refused := strings.Repeat("refused ", pageSize/8) + "save"
+	fsys := newNFSFileSystem(&echoRefusingClient{newMemoryClient(map[string]string{objectPath: "source"})})
+	truncateAsNFS(t, fsys, objectPath, 0)
+	_, _ = writeAsNFS(t, fsys, objectPath, refused[:pageSize], 0)
+	if _, err := writeAsNFS(t, fsys, objectPath, refused[pageSize:], pageSize); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("a refused compile should fail the write with EIO, got %v", err)
+	}
+
+	// Sent again in the pieces it was written in,
+	if committed, err := writeAsNFS(t, fsys, objectPath, refused[:pageSize], 0); committed || err != nil {
+		t.Fatalf("the first page should be held, got %v, %v", committed, err)
+	}
+	if _, err := writeAsNFS(t, fsys, objectPath, refused[pageSize:], pageSize); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("the file sent again should be answered with its refusal, got %v", err)
+	}
+	// or with its end first.
+	if _, err := writeAsNFS(t, fsys, objectPath, refused[pageSize:], pageSize); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("the end of the file sent again should be answered with its refusal, got %v", err)
+	}
+	if refusals := refusalsIn(t, fsys); len(refusals) != 1 {
+		t.Fatalf("the refused save should be compiled and recorded once, got %d records", len(refusals))
+	}
+}
+
 func TestNFSCreatedTonelFileIsListedAndCompiledWhenWritten(t *testing.T) {
 	client := newMemoryClient(map[string]string{objectPath: "object"})
 	fsys := newNFSFileSystem(client)
@@ -461,6 +593,22 @@ func containsInfoNamed(infos []os.FileInfo, name string) bool {
 		}
 	}
 	return false
+}
+
+// refusalsIn answers what each refusal recorded in /errors says.
+func refusalsIn(t *testing.T, fsys *nfsFileSystem) []string {
+	t.Helper()
+	infos, err := fsys.ReadDir("/errors")
+	if err != nil {
+		t.Fatalf("readdir /errors: %v", err)
+	}
+	refusals := []string{}
+	for _, name := range namesOf(infos) {
+		if name != latestErrorName {
+			refusals = append(refusals, readAsNFS(t, fsys, "/errors/"+name))
+		}
+	}
+	return refusals
 }
 
 func namesOf(infos []os.FileInfo) []string {

@@ -173,6 +173,73 @@ func TestMountedProjection(t *testing.T) {
 		}
 	})
 
+	t.Run("a writer that checks only write(2) sees a refusal", func(t *testing.T) {
+		refused := "/tonel/Kernel/Refused.class.st"
+		version := "Class { #name : 'Refused', #comment : 'the image keeps this version' }\n"
+		client.put(refused, version)
+		err := writeAsBun(filepath.Join(mountPoint, refused), []byte("Class { #name : 'Refused' } syntax error\n"))
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("expected the write to fail with EIO, got %v", err)
+		}
+		if contents := client.contents(refused); contents != version {
+			t.Fatalf("the image should keep its version: %q", contents)
+		}
+		latest, err := os.ReadFile(filepath.Join(mountPoint, "errors", "latest.txt"))
+		if err != nil || !strings.Contains(string(latest), "Refused.class.st") {
+			t.Fatalf("errors/latest.txt: %q, %v", latest, err)
+		}
+		if contents, err := os.ReadFile(filepath.Join(mountPoint, refused)); err != nil || string(contents) != version {
+			t.Fatalf("reading after a refused save should show the image's version: %q, %v", contents, err)
+		}
+	})
+
+	t.Run("a writer that shortens a file in place compiles only its bytes", func(t *testing.T) {
+		shortened := "/tonel/Kernel/Shortened.class.st"
+		client.put(shortened, "Class { #name : 'Shortened', #comment : 'a longer version' }\n")
+		saved := "Class { #name : 'Shortened' }\n"
+		before := len(client.writes())
+		if err := writeAsBun(filepath.Join(mountPoint, shortened), []byte(saved)); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if writes := client.writes()[before:]; !slices.Equal(writes, []string{shortened + "=" + saved}) {
+			t.Fatalf("the image should compile the bytes written, once, without the old file's end, got %q", writes)
+		}
+		if contents, err := os.ReadFile(filepath.Join(mountPoint, shortened)); err != nil || string(contents) != saved {
+			t.Fatalf("read after the save: %q, %v", contents, err)
+		}
+	})
+
+	t.Run("a refused save is recorded once", func(t *testing.T) {
+		saves := map[string]func(string, []byte) error{
+			"/tonel/Kernel/RefusedOnce.class.st": func(name string, contents []byte) error {
+				return os.WriteFile(name, contents, 0o644)
+			},
+			"/tonel/Kernel/RefusedOnceThroughBun.class.st": writeAsBun,
+		}
+		for refused, save := range saves {
+			client.put(refused, "Class { #name : 'RefusedOnce', #comment : 'the image keeps this version' }\n")
+			if err := save(filepath.Join(mountPoint, refused), []byte("syntax error, once\n")); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("expected the save of %s to fail with EIO, got %v", refused, err)
+			}
+		}
+		// Past refusedSaveLasts: the client sends a refused file again as it
+		// drops it from its cache, and one it sent later than that would
+		// compile, and be recorded, again.
+		time.Sleep(2 * refusedSaveLasts)
+		for refused := range saves {
+			recorded := 0
+			for _, entry := range server.fsys.errors.EntriesIn(errorsRoot) {
+				contents, _ := server.fsys.errors.Read(errorsRoot + "/" + entry.Name)
+				if entry.Name != latestErrorName && strings.Contains(string(contents), "Path: "+refused+"\n") {
+					recorded++
+				}
+			}
+			if recorded != 1 {
+				t.Errorf("the refused save of %s should be recorded once, was %d times", refused, recorded)
+			}
+		}
+	})
+
 	t.Run("read-only files refuse writing", func(t *testing.T) {
 		critique := filepath.Join(mountPoint, "critiques", "Kernel", "Object.md")
 		err := os.WriteFile(critique, []byte("mine"), 0o644)
@@ -221,6 +288,21 @@ func TestMountedProjection(t *testing.T) {
 			}
 		}
 	})
+}
+
+// writeAsBun writes contents to name as Bun's fs.writeFile does, which
+// OpenCode saves with: it opens without O_TRUNC, writes, sets the size of
+// what write(2) took and closes, and answers only what open(2) and write(2)
+// answered.
+func writeAsBun(name string, contents []byte) error {
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0o666)
+	if err != nil {
+		return err
+	}
+	written, err := file.Write(contents)
+	_ = file.Truncate(int64(written))
+	_ = file.Close()
+	return err
 }
 
 func TestTheMountTableAnswersWhatIsMountedWhere(t *testing.T) {
