@@ -33,6 +33,15 @@ import (
 // What no close compiled compiles when the last descriptor goes, and a
 // refusal then reaches only /errors.
 //
+// A file opened neither truncating nor appending is written in place, as
+// Bun's fs.writeFile, which OpenCode saves with, writes: it answers only what
+// open(2) and write(2) answered. Its writes compile at the write that
+// completes the file, as on NFS, so a refusal fails that write(2) (see
+// fuseFile.inPlace). A file created exclusively is not written in place,
+// though Linux sends its create without O_TRUNC: archive extractors and a
+// shell's > under noclobber create so, and write in pieces that cut the file
+// anywhere, so it compiles at the close.
+//
 // Removing a file removes it at once, from the image too, whether it is open
 // or not; its open descriptors answer ESTALE from then on, as for a file
 // removed on an NFS server.
@@ -136,6 +145,16 @@ type fuseFile struct {
 	node     *fuseNode
 	writable bool
 	appends  bool
+	// inPlace says the file writes over what it opened, neither truncated at
+	// open nor appended to nor created exclusively, as a writer does that
+	// sets the size of what it wrote after its writes. Its write that
+	// completes a file, from 0 and ending inside a page (see
+	// heldFile.isWhole), compiles it; its write at 0 with nothing held starts
+	// the file over, so a shorter file does not compile over the image's
+	// longer one; and a size it sets after a refusal, before it writes again,
+	// changes nothing: Bun sets the size of what write(2) took, nothing when
+	// the write was refused.
+	inPlace bool
 	// syncs says each write is synced, which the kernel does with an fsync
 	// after it.
 	syncs bool
@@ -293,6 +312,7 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		node:     n,
 		writable: flags&linuxOpenAccessMode != linuxOpenReadOnly || flags&linuxOpenTruncate != 0,
 		appends:  flags&linuxOpenAppend != 0,
+		inPlace:  flags&(linuxOpenTruncate|linuxOpenAppend) == 0,
 		syncs:    flags&linuxOpenDataSync != 0,
 	}
 	if file.writable {
@@ -321,7 +341,7 @@ func (n *fuseNode) Create(ctx context.Context, name string, flags uint32, _ uint
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
-	file := &fuseFile{node: node, writable: true, appends: flags&linuxOpenAppend != 0, syncs: flags&linuxOpenDataSync != 0, opener: n.fsys.callerProcess(ctx)}
+	file := &fuseFile{node: node, writable: true, appends: flags&linuxOpenAppend != 0, inPlace: flags&(linuxOpenTruncate|linuxOpenAppend|linuxOpenExclusive) == 0, syncs: flags&linuxOpenDataSync != 0, opener: n.fsys.callerProcess(ctx)}
 	n.fsys.opened(file)
 	var attributes fuse.AttrOut
 	if errno := node.Getattr(ctx, file, &attributes); errno == 0 {
@@ -436,6 +456,7 @@ func (n *fuseNode) Mkdir(ctx context.Context, name string, _ uint32, out *fuse.E
 const (
 	linuxOpenAccessMode = 0o3
 	linuxOpenReadOnly   = 0o0
+	linuxOpenExclusive  = 0o200
 	linuxOpenTruncate   = 0o1000
 	linuxOpenAppend     = 0o2000
 	linuxOpenDataSync   = 0o10000
@@ -599,8 +620,19 @@ func (fsys *fuseFileSystem) holdsWritesLocked(file *fuseFile, projectionPath str
 
 // write writes data at offset into file, or at its end when it appends: the
 // kernel takes the end from the size it has, which the image may have
-// changed since.
+// changed since. Written in place, the write that completes a file compiles
+// it, and answers the compile's result.
 func (fsys *fuseFileSystem) write(file *fuseFile, data []byte, offset int64) syscall.Errno {
+	compiled, errno := fsys.writeChanging(file, data, offset)
+	if compiled {
+		// The writer's cached size is that of what it wrote.
+		file.node.dropCachedAttributes()
+	}
+	return errno
+}
+
+// writeChanging is write's change, and answers whether it compiled the file.
+func (fsys *fuseFileSystem) writeChanging(file *fuseFile, data []byte, offset int64) (bool, syscall.Errno) {
 	fsys.changing.Lock()
 	defer fsys.endChange()
 
@@ -610,25 +642,43 @@ func (fsys *fuseFileSystem) write(file *fuseFile, data []byte, offset int64) sys
 
 	projectionPath, errno := file.node.path()
 	if errno != 0 {
-		return errno
+		return false, errno
 	}
 	base = fsys.baseStill(projectionPath, base, baseTime)
 	place, errno := fsys.writeKind(projectionPath)
 	if errno != 0 {
-		return errno
+		return false, errno
 	}
 	if file.appends {
 		offset = atTheEnd
 	}
+	inPlace := file.inPlace && place == heldForTheImage
+	if held, _ := fsys.heldAt(projectionPath); inPlace && offset == 0 && len(data) > 0 && !held {
+		base = []byte{}
+	}
 	if err := fsys.writeLocked(projectionPath, data, offset, base); err != nil {
-		return errnoOf(err)
+		return false, errnoOf(err)
 	}
-	if place == heldForTheImage {
-		fsys.handles.Lock()
-		fsys.wroteLocked(file, projectionPath)
-		fsys.handles.Unlock()
+	if place != heldForTheImage {
+		return false, 0
 	}
-	return 0
+	fsys.handles.Lock()
+	fsys.wroteLocked(file, projectionPath)
+	fsys.handles.Unlock()
+	if _, whole := fsys.heldAt(projectionPath); !inPlace || !whole {
+		return false, 0
+	}
+	fsys.keepOff(projectionPath)
+	return true, errnoOf(fsys.commitLocked(projectionPath))
+}
+
+// heldAt answers whether writes are held for the file at projectionPath, and
+// whether they make a whole file (see heldFile.isWhole).
+func (fsys *fuseFileSystem) heldAt(projectionPath string) (held bool, whole bool) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	writes, held := fsys.pending[projectionPath]
+	return held, held && writes.isWhole()
 }
 
 // baseStill answers base, what a file's last compile took, while the file
@@ -649,7 +699,9 @@ func (fsys *fuseFileSystem) baseStill(projectionPath string, base []byte, baseTi
 // setSize sets the size of node's file. Through file, an ftruncate, the
 // size is file's write, which its close compiles; without one, a
 // truncate(2), it compiles now, since nothing follows it. The image's size,
-// or that of what this mount last compiled, changes nothing either way.
+// or that of what this mount last compiled, changes nothing either way, nor
+// does a size a file written in place sets after a refusal, before it writes
+// again (see fuseFile.inPlace).
 func (fsys *fuseFileSystem) setSize(node *fuseNode, file *fuseFile, size uint64) syscall.Errno {
 	if size > maxFileSize {
 		return syscall.EFBIG
@@ -660,8 +712,10 @@ func (fsys *fuseFileSystem) setSize(node *fuseNode, file *fuseFile, size uint64)
 	fsys.handles.Lock()
 	var base []byte
 	var baseTime time.Time
+	refused := false
 	if file != nil {
 		base, baseTime = file.base, file.baseTime
+		refused = file.inPlace && file.refusal != nil && !file.wrote
 	}
 	fsys.handles.Unlock()
 
@@ -673,6 +727,9 @@ func (fsys *fuseFileSystem) setSize(node *fuseNode, file *fuseFile, size uint64)
 	place, errno := fsys.writeKind(projectionPath)
 	if errno != 0 {
 		return errno
+	}
+	if held, _ := fsys.heldAt(projectionPath); refused && place == heldForTheImage && !held {
+		return 0
 	}
 	fsys.keepOff(projectionPath)
 	resized, err := fsys.resizeLocked(projectionPath, int(size))
