@@ -77,6 +77,10 @@ func Mount(mountPoint string, client protocol.Client, config Config) error {
 //   - actimeo=1 and nonegnamecache show changes made in the image within a
 //     second; the client checks a file again whenever it opens it.
 //   - soft,intr fail calls to a gone daemon instead of hanging them.
+//   - sync makes each write(2) wait for its WRITE, so a refused compile fails
+//     the write(2) that completes the file. Otherwise the client sends it at
+//     ftruncate(2), close(2) or fsync(2), whose answers Bun's fs.writeFile
+//     ignores.
 //   - nobrowse keeps Finder and Spotlight off it.
 func mountNFSArguments(port int, mountPoint string, config Config) []string {
 	options := []string{
@@ -85,6 +89,7 @@ func mountNFSArguments(port int, mountPoint string, config Config) []string {
 		"noresvport", "locallocks", "nordirplus",
 		"actimeo=1", "nonegnamecache",
 		"soft", "intr", "timeo=100", "retrans=5",
+		"sync",
 		"nobrowse",
 	}
 	export, others := mountNameAndOptions(config.MountOptions)

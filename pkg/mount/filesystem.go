@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"hash/fnv"
 	"os"
@@ -20,6 +21,11 @@ const (
 	// listingFreshness is how long a directory's listing stands for its
 	// modification time, which every lookup in it asks for.
 	listingFreshness = time.Second
+	// refusedSaveLasts is how long after a refusal the calls on its file are
+	// still the refused save's: the client sends a refused file again as it
+	// drops it from its cache, and a writer sets the size of what it wrote
+	// after its writes, both at once.
+	refusedSaveLasts = time.Second
 )
 
 // maxFileSize bounds what a write or truncation may make a file: no class
@@ -54,6 +60,10 @@ type fileSystem struct {
 	// its last listing is a second old, so that its time moves with what the
 	// image changes: for a client that caches listings by that time.
 	listsDirectoriesOnStat bool
+	// answersRefusedSaves makes the calls a refused save still makes answer
+	// as that save, without compiling again (see refusalLocked): for a client
+	// that sends a refused file again as it drops it from its cache.
+	answersRefusedSaves bool
 
 	changing sync.Mutex
 	// overBackup holds the names a create took from a class an editor's
@@ -73,6 +83,9 @@ type fileSystem struct {
 	// compiled holds the length of what this mount last compiled at each
 	// path.
 	compiled map[string]int
+	// refusals holds, for each path, the save the image last refused there,
+	// where answersRefusedSaves asks for them.
+	refusals map[string]refusal
 	changed  map[string]time.Time
 	// seen holds, for each file, the entry the last stat of it recorded, and
 	// stats the number of the last stat that recorded one.
@@ -98,6 +111,7 @@ func newFileSystem(client protocol.Client) *fileSystem {
 		marks:      map[string]uint64{},
 		pending:    map[string]*heldFile{},
 		compiled:   map[string]int{},
+		refusals:   map[string]refusal{},
 		changed:    map[string]time.Time{},
 		seen:       map[string]seenEntry{},
 		listings:   map[string]listing{},
@@ -240,33 +254,107 @@ func (fsys *fileSystem) observe(resolve func() (string, error), read func(projec
 }
 
 // commitHeld compiles the writes held for the file at projectionPath, and
-// drops them either way: the file is the image's from then on. The caller
-// holds changing, and keeps calls off projectionPath.
+// drops them either way: the file is the image's from then on. The refused
+// file sent again is answered with its refusal, and compiles no more. The
+// caller holds changing, and keeps calls off projectionPath.
 func (fsys *fileSystem) commitHeld(projectionPath string) error {
 	fsys.mu.Lock()
 	held, ok := fsys.pending[projectionPath]
 	var contents []byte
+	var refused refusal
+	sentAgain := false
 	if ok {
 		contents = held.contents
+		refused, sentAgain = fsys.refusalLocked(projectionPath)
+		sentAgain = sentAgain && bytes.Equal(refused.contents, contents)
 	}
 	fsys.mu.Unlock()
 	if !ok {
 		return nil
 	}
 
-	err := fsys.writeProjection(context.Background(), projectionPath, contents)
+	var err error
+	if sentAgain {
+		err = refused.err
+	} else {
+		err = fsys.writeProjection(context.Background(), projectionPath, contents)
+	}
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 	delete(fsys.pending, projectionPath)
 	if err != nil {
+		if fsys.answersRefusedSaves && !sentAgain {
+			fsys.refusedLocked(projectionPath, refusal{contents: contents, emptied: held.emptied, err: err, at: fsys.clock()})
+		}
 		// A file created through the mount leaves its directory with it.
 		fsys.namespaceChangedLocked(projectionPath)
 		return pathError("write", projectionPath, errnoFor(err))
 	}
+	delete(fsys.refusals, projectionPath)
 	fsys.contentsChangedLocked(projectionPath)
 	fsys.compiled[projectionPath] = len(contents)
 	delete(fsys.overBackup, projectionPath)
 	return nil
+}
+
+// refusal is a save the image refused: what it compiled, whether the save
+// emptied the file before it wrote, why the image refused it, when, and
+// whether its writer has set the file's size since.
+type refusal struct {
+	contents []byte
+	emptied  bool
+	err      error
+	at       time.Time
+	sized    bool
+}
+
+// refusalLocked answers the refusal that stands at projectionPath: the last
+// save there was refused less than refusedSaveLasts ago, and no save of the
+// file began since, so the calls on it are still the refused save's. The
+// caller holds mu.
+func (fsys *fileSystem) refusalLocked(projectionPath string) (refusal, bool) {
+	refused, ok := fsys.refusals[projectionPath]
+	if ok && fsys.clock().Sub(refused.at) >= refusedSaveLasts {
+		delete(fsys.refusals, projectionPath)
+		return refusal{}, false
+	}
+	return refused, ok
+}
+
+// refusedLocked records that the image refused the save at projectionPath,
+// and forgets the refusals whose saves are over. The caller holds mu.
+func (fsys *fileSystem) refusedLocked(projectionPath string, refused refusal) {
+	for each := range fsys.refusals {
+		fsys.refusalLocked(each)
+	}
+	fsys.refusals[projectionPath] = refused
+}
+
+// sizedByRefusedSave answers whether a size set on the file at
+// projectionPath, with nothing held for it, is the refused save's: a writer
+// that does not truncate at open sets the size of what write(2) took after
+// its writes, as Bun's fs.writeFile does, which is nothing when the write
+// that completed the file was refused, and the whole file when the refusal
+// came at the COMMIT. The image's version stands. The writer sets the size
+// once: a size of 0 after that, or after a save that emptied the file first,
+// begins a new save instead.
+func (fsys *fileSystem) sizedByRefusedSave(projectionPath string, size int) bool {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	refused, ok := fsys.refusalLocked(projectionPath)
+	if !ok || refused.sized {
+		return false
+	}
+	sized := size == len(refused.contents)
+	if size == 0 {
+		sized = !refused.emptied
+	}
+	if !sized {
+		return false
+	}
+	refused.sized = true
+	fsys.refusals[projectionPath] = refused
+	return true
 }
 
 // entryFor answers the entry at projectionPath, as the writes held for it
@@ -450,11 +538,13 @@ func (fsys *fileSystem) unlinkFile(projectionPath string) syscall.Errno {
 }
 
 // renamedOver records that a rename took newPath, and left oldPath: what was
-// held for the file it replaced goes with that file, and the id moves. The
-// caller holds changing.
+// held for the file it replaced, and its refused save, go with that file,
+// and the id moves. The caller holds changing.
 func (fsys *fileSystem) renamedOver(oldPath string, newPath string) {
 	fsys.mu.Lock()
 	delete(fsys.pending, newPath)
+	delete(fsys.refusals, oldPath)
+	delete(fsys.refusals, newPath)
 	fsys.mu.Unlock()
 	delete(fsys.overBackup, oldPath)
 	delete(fsys.overBackup, newPath)
@@ -559,6 +649,12 @@ func (fsys *fileSystem) nowLocked() time.Time {
 
 // writeAt writes data at offset into file, held in pending or in the
 // overlay, wherever file is by now.
+//
+// With nothing held for the file, a write at 0 starts it over: a writer that
+// does not truncate at open sets the size after its writes, as Bun's
+// fs.writeFile does, and the image's version must not stand behind its
+// bytes. A write elsewhere lands in the refused file its client sends again,
+// or in the image's version.
 func (fsys *fileSystem) writeAt(file openFile, data []byte, offset int64) error {
 	if err := checkWrite(file, data, offset); err != nil {
 		return err
@@ -568,7 +664,17 @@ func (fsys *fileSystem) writeAt(file openFile, data []byte, offset int64) error 
 		return err
 	}
 	defer fsys.endChange()
-	return fsys.writeLocked(projectionPath, data, offset, nil)
+	var base []byte
+	if offset == 0 && len(data) > 0 {
+		base = []byte{}
+	} else {
+		fsys.mu.Lock()
+		if refused, ok := fsys.refusalLocked(projectionPath); ok {
+			base = refused.contents
+		}
+		fsys.mu.Unlock()
+	}
+	return fsys.writeLocked(projectionPath, data, offset, base)
 }
 
 // checkWrite refuses a write no file reaches, before anything is allocated.
@@ -663,8 +769,9 @@ func (fsys *fileSystem) writeLocked(projectionPath string, data []byte, offset i
 // so no write follows a size set on a projected file with nothing held, but
 // the 0 a save starts with. The file already has that size when it is the
 // image's, or that of what the client wrote and the image compiled, which a
-// client writing a file in place sets after; otherwise the file is compiled,
-// cut to that size, now.
+// client writing a file in place sets after; a size the writer of a refused
+// save sets after its writes leaves the image's version (see
+// sizedByRefusedSave); otherwise the file is compiled, cut to that size, now.
 func (fsys *fileSystem) truncate(file openFile, size int64) error {
 	if err := checkSize(file, size); err != nil {
 		return err
@@ -676,6 +783,9 @@ func (fsys *fileSystem) truncate(file openFile, size int64) error {
 	defer fsys.endChange()
 	if resized, err := fsys.resizeLocked(projectionPath, int(size)); resized || err != nil {
 		return err
+	}
+	if fsys.sizedByRefusedSave(projectionPath, int(size)) {
+		return nil
 	}
 	if size == 0 {
 		// A save starts by emptying the file: what the image has is not needed.
@@ -716,11 +826,13 @@ func (fsys *fileSystem) resizeLocked(projectionPath string, size int) (bool, err
 }
 
 // startSaveLocked holds no bytes for the file at projectionPath, as a save
-// that empties the file starts. The caller holds changing.
+// that empties the file starts: a refused save there is over. The caller
+// holds changing.
 func (fsys *fileSystem) startSaveLocked(projectionPath string) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
-	fsys.pending[projectionPath] = &heldFile{}
+	fsys.pending[projectionPath] = &heldFile{emptied: true}
+	delete(fsys.refusals, projectionPath)
 	fsys.changed[projectionPath] = fsys.nowLocked()
 }
 
@@ -846,11 +958,14 @@ type cachedRead struct {
 	modified int64
 }
 
-// heldFile is a projected file's contents as written so far, and which of
-// its bytes were written rather than left by a truncation.
+// heldFile is a projected file's contents as written so far, which of its
+// bytes were written rather than left by a truncation, and whether its save
+// emptied the file before it wrote, as an open that truncates or a create
+// does.
 type heldFile struct {
 	contents []byte
 	written  []span
+	emptied  bool
 }
 
 type span struct {
