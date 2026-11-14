@@ -20,7 +20,7 @@ import (
 )
 
 func TestTheAdapterReadsLinuxsOpenFlags(t *testing.T) {
-	if linuxOpenTruncate != syscall.O_TRUNC || linuxOpenAppend != syscall.O_APPEND || linuxOpenAccessMode != syscall.O_ACCMODE || linuxOpenReadOnly != syscall.O_RDONLY {
+	if linuxOpenTruncate != syscall.O_TRUNC || linuxOpenExclusive != syscall.O_EXCL || linuxOpenAppend != syscall.O_APPEND || linuxOpenAccessMode != syscall.O_ACCMODE || linuxOpenReadOnly != syscall.O_RDONLY {
 		t.Fatalf("the adapter's open flags should be Linux's")
 	}
 	if renameNoReplace != unix.RENAME_NOREPLACE || renameExchange != unix.RENAME_EXCHANGE || renameWhiteout != unix.RENAME_WHITEOUT {
@@ -143,6 +143,38 @@ func TestMountedProjectionOnLinux(t *testing.T) {
 			t.Fatalf("fsync should report the refusal, got %v", err)
 		}
 		_ = file.Close()
+	})
+
+	t.Run("a writer that checks only write(2) sees a refusal", func(t *testing.T) {
+		refused := "/tonel/Kernel/Refused.class.st"
+		version := "Class { #name : 'Refused', #comment : 'the image keeps this version' }\n"
+		client.put(refused, version)
+		if err := writeAsBun(path(refused), []byte("Class { #name : 'Refused' } syntax error\n")); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("expected the write to fail with EIO, got %v", err)
+		}
+		if contents := client.contents(refused); contents != version {
+			t.Fatalf("the image should keep its version, has %q", contents)
+		}
+		if contents, err := os.ReadFile(path(refused)); err != nil || string(contents) != version {
+			t.Fatalf("reading after a refused save should show the image's version: %q, %v", contents, err)
+		}
+	})
+
+	t.Run("a writer in place compiles only its bytes, once", func(t *testing.T) {
+		shortened := "/tonel/Kernel/Shortened.class.st"
+		client.put(shortened, "Class { #name : 'Shortened', #comment : 'a longer version' }\n")
+		saved := "Class { #name : 'Shortened' }\n"
+		writes := compiles(func() {
+			if err := writeAsBun(path(shortened), []byte(saved)); err != nil {
+				t.Fatalf("save: %v", err)
+			}
+		})
+		if !slices.Equal(writes, []string{shortened + "=" + saved}) {
+			t.Fatalf("the image should compile the bytes written, once, without the old file's end, got %q", writes)
+		}
+		if contents, err := os.ReadFile(path(shortened)); err != nil || string(contents) != saved {
+			t.Fatalf("read after the save: %q, %v", contents, err)
+		}
 	})
 
 	t.Run("a safe save keeps the temp file's number", func(t *testing.T) {

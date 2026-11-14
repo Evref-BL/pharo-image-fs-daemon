@@ -553,7 +553,9 @@ func TestFUSERefusedNewClassLeavesItsDirectory(t *testing.T) {
 	client := newMemoryClient(map[string]string{objectPath: "source"})
 	k := newTestKernel(t, client)
 	created := "/tonel/Kernel/New.class.st"
-	file := k.mustCreate(created, openWriteOnly, writer)
+	// As a shell's > creates it; a file created in place compiles at its
+	// write (see TestFUSEANewClassWrittenInPlaceHearsItsRefusal).
+	file := k.mustCreate(created, openWriteOnly|openTruncate, writer)
 	k.mustWrite(file, 0, "syntax error")
 	if status := k.close(file, writer); status != fuse.EIO {
 		t.Fatalf("the close should report the refusal, got %v", status)
@@ -664,7 +666,7 @@ func TestFUSERemovingAnOpenFileRemovesItsClassAndLeavesItsDescriptorsStale(t *te
 	client := newMemoryClient(map[string]string{objectPath: "old source", "/tonel/Kernel/Other.class.st": "other"})
 	k := newTestKernel(t, client)
 	reader := k.mustOpen(objectPath, openReadOnly, writer)
-	writable := k.mustOpen(objectPath, openReadWrite, child)
+	writable := k.mustOpen(objectPath, openReadWrite|openTruncate, child)
 	k.mustWrite(writable, 0, "held")
 	if status := k.unlink(objectPath); status != fuse.OK {
 		t.Fatalf("unlink: %v", status)
@@ -813,6 +815,19 @@ type emptyRefusingClient struct {
 func (c *emptyRefusingClient) Write(ctx context.Context, filePath string, contents []byte) (protocol.WriteResult, error) {
 	if len(contents) == 0 {
 		return protocol.WriteResult{}, &protocol.Error{StatusCode: http.StatusBadRequest, Message: "Expected exactly one class definition, got 0"}
+	}
+	return c.memoryClient.Write(ctx, filePath, contents)
+}
+
+// cutMethodRefusingClient refuses a class file whose last method is not
+// closed, as the image refuses a file cut in the middle of a method.
+type cutMethodRefusingClient struct {
+	*memoryClient
+}
+
+func (c *cutMethodRefusingClient) Write(ctx context.Context, filePath string, contents []byte) (protocol.WriteResult, error) {
+	if !strings.HasSuffix(string(contents), "]\n") {
+		return protocol.WriteResult{}, &protocol.Error{StatusCode: http.StatusBadRequest, Message: "Unmatched [ in method body"}
 	}
 	return c.memoryClient.Write(ctx, filePath, contents)
 }
@@ -1040,7 +1055,7 @@ func TestFUSEACreatedFileThatLeftIsStale(t *testing.T) {
 		},
 	} {
 		k := newTestKernel(t, newMemoryClient(map[string]string{objectPath: "source"}))
-		file := k.mustCreate(created, openWriteOnly, writer)
+		file := k.mustCreate(created, openWriteOnly|openTruncate, writer)
 		leave(k, file)
 		k.release(file)
 		// The kernel still trusts the name, and opens its node.
@@ -1188,6 +1203,151 @@ func TestFUSESizesThroughAFileWithNothingHeld(t *testing.T) {
 	k.release(file)
 	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=old"}) {
 		t.Fatalf("the close should compile the file cut, got %v", writes)
+	}
+}
+
+// writeInPlace writes contents through file as Bun's fs.writeFile, which
+// OpenCode saves with, does once it opened the file without O_TRUNC: from 0,
+// then the size of what write(2) took. It answers what write(2) answered,
+// the last call Bun checks.
+func (k *testKernel) writeInPlace(file openedFile, contents string) fuse.Status {
+	k.t.Helper()
+	status := k.write(file, 0, contents)
+	written := uint64(len(contents))
+	if status != fuse.OK {
+		written = 0
+	}
+	k.setSize(file.node, &file, written)
+	return status
+}
+
+// refusals answers what each refusal recorded in /errors says.
+func (k *testKernel) refusals() []string {
+	k.t.Helper()
+	refusals := []string{}
+	for _, name := range k.list("/errors") {
+		if name != latestErrorName {
+			refusals = append(refusals, k.readFile("/errors/"+name))
+		}
+	}
+	return refusals
+}
+
+func TestFUSEAWriterInPlaceHearsARefusalFromItsWrite(t *testing.T) {
+	old := "an older and much longer source"
+	client := &emptyRefusingClient{newMemoryClient(map[string]string{objectPath: old})}
+	k := newTestKernel(t, client)
+	file := k.mustOpen(objectPath, openWriteOnly, writer)
+	if status := k.writeInPlace(file, "syntax error"); status != fuse.EIO {
+		t.Fatalf("a writer that checks only write(2) should see the refusal there, got %v", status)
+	}
+	if status := k.close(file, writer); status != fuse.EIO {
+		t.Fatalf("the close should answer the refusal again, got %v", status)
+	}
+	k.release(file)
+	if contents := k.readFile(objectPath); contents != old {
+		t.Fatalf("the image's version should stand, read %q", contents)
+	}
+	if refusals := k.refusals(); len(refusals) != 1 || !strings.Contains(refusals[0], "syntax error") {
+		t.Fatalf("the size the refused writer set should compile nothing, /errors has %q", refusals)
+	}
+
+	// The next save starts the file over, and compiles at its write.
+	file = k.mustOpen(objectPath, openWriteOnly, writer)
+	if status := k.writeInPlace(file, "new source"); status != fuse.OK {
+		t.Fatalf("save: %v", status)
+	}
+	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=new source"}) {
+		t.Fatalf("the write should compile the bytes written, without the old file's end, got %v", writes)
+	}
+	if status := k.close(file, writer); status != fuse.OK {
+		t.Fatalf("close: %v", status)
+	}
+	k.release(file)
+	if writes := client.writes(); len(writes) != 1 {
+		t.Fatalf("the save should compile once, got %v", writes)
+	}
+}
+
+func TestFUSEANewClassWrittenInPlaceHearsItsRefusal(t *testing.T) {
+	k := newTestKernel(t, newMemoryClient(map[string]string{objectPath: "source"}))
+	created := "/tonel/Kernel/New.class.st"
+	file := k.mustCreate(created, openWriteOnly, writer)
+	if status := k.writeInPlace(file, "syntax error"); status != fuse.EIO {
+		t.Fatalf("a writer that checks only write(2) should see the refusal there, got %v", status)
+	}
+	k.close(file, writer)
+	k.release(file)
+	if names := k.list("/tonel/Kernel"); slices.Contains(names, "New.class.st") {
+		t.Fatalf("a refused new class should leave its directory, got %v", names)
+	}
+	in := fuse.OpenIn{InHeader: header(file.node, writer), Flags: openWriteOnly}
+	var out fuse.OpenOut
+	if status := k.raw.Open(nil, &in, &out); status != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("opening a refused new class should be stale, so the kernel looks the name up again, got %v", status)
+	}
+}
+
+// An archive extractor, as GNU tar and bsdtar do, or a shell's > under
+// noclobber, creates a file exclusively, which Linux sends without O_TRUNC,
+// and writes it in pieces that cut it anywhere: GNU tar's first write is
+// what its 10240-byte record holds after the header.
+func TestFUSEAFileCreatedExclusivelyCompilesAtItsClose(t *testing.T) {
+	client := &cutMethodRefusingClient{newMemoryClient(map[string]string{objectPath: "source"})}
+	k := newTestKernel(t, client)
+	created := "/tonel/Kernel/New.class.st"
+	contents := "Class { #name : 'New' }\n" + strings.Repeat("New >> m [ ^ 1 ]\n", 900)
+	record := 9728
+	file := k.mustCreate(created, openWriteOnly|openExclusive, writer)
+	k.mustWrite(file, 0, contents[:record])
+	k.mustWrite(file, uint64(record), contents[record:])
+	if writes := client.writes(); len(writes) != 0 {
+		t.Fatalf("a file created exclusively should compile at its close, got %d compiles", len(writes))
+	}
+	if status := k.close(file, writer); status != fuse.OK {
+		t.Fatalf("close: %v", status)
+	}
+	k.release(file)
+	if writes := client.writes(); !slices.Equal(writes, []string{created + "=" + contents}) {
+		t.Fatalf("the close should compile the whole file, once, got %d compiles", len(writes))
+	}
+	if refusals := k.refusals(); len(refusals) != 0 {
+		t.Fatalf("nothing should be refused, /errors has %q", refusals)
+	}
+}
+
+func TestFUSEAWriterInPlaceCompilesAtTheWriteThatEndsTheFile(t *testing.T) {
+	client := newMemoryClient(map[string]string{objectPath: "old source"})
+	k := newTestKernel(t, client)
+	page := strings.Repeat("a", pageSize)
+	file := k.mustOpen(objectPath, openWriteOnly, writer)
+	k.mustWrite(file, 0, page)
+	if writes := client.writes(); len(writes) != 0 {
+		t.Fatalf("a write ending on a page is not the end of a file, got %d compiles", len(writes))
+	}
+	k.mustWrite(file, pageSize, "end")
+	if writes := client.writes(); !slices.Equal(writes, []string{objectPath + "=" + page + "end"}) {
+		t.Fatalf("the write that ends the file should compile it, got %d compiles", len(writes))
+	}
+	k.close(file, writer)
+	k.release(file)
+	if writes := client.writes(); len(writes) != 1 {
+		t.Fatalf("the save should compile once, got %d compiles", len(writes))
+	}
+
+	// A file of whole pages is the start of a longer one, as far as its
+	// writes tell: it compiles at the close.
+	file = k.mustOpen(objectPath, openWriteOnly, writer)
+	k.mustWrite(file, 0, page)
+	if writes := client.writes(); len(writes) != 1 {
+		t.Fatalf("a write ending on a page is not the end of a file, got %d compiles", len(writes))
+	}
+	if status := k.close(file, writer); status != fuse.OK {
+		t.Fatalf("close: %v", status)
+	}
+	k.release(file)
+	if writes := client.writes(); len(writes) != 2 || writes[1] != objectPath+"="+page {
+		t.Fatalf("the close should compile the file of whole pages, got %d compiles", len(writes))
 	}
 }
 
