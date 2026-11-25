@@ -42,7 +42,10 @@ jobs:
             asset="pharo-image-fs-daemon-${target%/*}-${target#*/}"
             mkdir -p "build/$asset"
             GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -ldflags="-s -w" -o "build/$asset/pharo-image-fs" ./cmd/pharo-image-fs
-            (cd "build/$asset" && sha256sum pharo-image-fs > pharo-image-fs.sha256 && zip "../$asset.zip" pharo-image-fs pharo-image-fs.sha256)
+            # The binary's licence, and those of the modules compiled into it.
+            cp LICENSE "build/$asset/LICENSE"
+            GOOS="${target%/*}" GOARCH="${target#*/}" scripts/third-party-licenses.sh > "build/$asset/THIRD_PARTY_LICENSES"
+            (cd "build/$asset" && sha256sum pharo-image-fs > pharo-image-fs.sha256 && zip "../$asset.zip" pharo-image-fs pharo-image-fs.sha256 LICENSE THIRD_PARTY_LICENSES)
           done
 
       - name: Publish release assets

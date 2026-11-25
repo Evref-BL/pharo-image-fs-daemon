@@ -75,6 +75,13 @@ jobs:
           GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/pharo-image-fs
           GOOS=darwin GOARCH=amd64 go build -o /dev/null ./cmd/pharo-image-fs
 
+      # A release ships the licence of every module in the binary.
+      - name: Find every module's licence, as released
+        run: |
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}" scripts/third-party-licenses.sh > /dev/null
+          done
+
   # The one check main's ruleset requires: it fails unless every job above
   # passed, so the rule names no job, nor any runner of a matrix.
   gate:
